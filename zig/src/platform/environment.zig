@@ -107,6 +107,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_DSV41_ROUND_PROF", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1 logs DeepSeek-V4.1 Metal decode rounds' host and GPU milliseconds by rows)" },
     .{ .name = "TF_FLASHNEXT_SCALE_INDEX", .scope = .metal, .kind = .flag, .forms = "0 or 1 (0: Flash Next's 4-bit expert kernels read the stored scales and biases, not their 16-bit index)" },
     .{ .name = "GLM_EHPROJ_NAX", .scope = .metal, .kind = .flag, .forms = "0 or 1 (0 serves GLM's MTP eh_proj on the scalar kernel)" },
+    .{ .name = "TF_GLM_KEYED_DRAFTS", .scope = .metal, .kind = .flag, .forms = "0 or 1 (0 drafts a sampled GLM-5.3-Flash stream's MTP tokens by argmax; default 1, its keyed draw at half its temperature)" },
     .{ .name = "TF_FLASHNEXT_GROUPED_ROWS", .scope = .metal, .kind = .size, .forms = "0 (never) or the rows, 1 to 32, from which a window's experts run grouped", .max = 32 },
     .{ .name = "TF_FN_GX_GATEUP_MB2", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1: Flash Next's grouped gate/up decodes an expert's weights once for two rows; same output bits)" },
     .{ .name = "TF_QWEN27_SLOT_RESUME", .scope = .metal, .kind = .flag, .forms = "0 or 1 (0 stops slot 0 resuming a later prompt; unset or blank keeps it on)" },
