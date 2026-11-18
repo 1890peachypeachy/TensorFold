@@ -90,3 +90,7 @@ test {
 test {
     _ = @import("cuda_train_locate.zig");
 }
+
+test {
+    _ = @import("cuda_usage_test.zig");
+}
