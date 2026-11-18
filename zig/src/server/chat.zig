@@ -60,6 +60,8 @@ pub const Input = struct {
     fill_room: bool = false,
     /// ``"execution_witness": true``: the reply binds the witness, its prompt, resolved request and tokens.
     execution_witness: bool = false,
+    /// The reply continues the final assistant message (continue_final_message, or a Messages prefill): prefill.zig.
+    prefill: bool = false,
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
