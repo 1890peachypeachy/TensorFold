@@ -74,6 +74,8 @@ pub const Request = struct {
     unread: ?*const std.atomic.Value(u32) = null,
     /// ``cache_key`` is salted (cache_salt): the lane host neither drafts from nor adds to Recall's shared record.
     salted: bool = false,
+    /// A streamed prompt can report progress before its first token.
+    return_progress: bool = false,
     /// The full salt id that produced `cache_key`, compared separately from its non-injective masked words.
     cache_salt: u64 = 0,
 
