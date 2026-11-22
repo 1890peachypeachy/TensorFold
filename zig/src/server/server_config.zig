@@ -47,6 +47,7 @@ pub const Config = struct {
     seed_salt: i64 = 0,
     silence_mid: bool = false,
     silence_guard: bool = false,
+    speech: @import("speech_cli.zig").Flags = .{},
     cfg: ?@import("drama_cfg.zig").Options = null,
     prompt_seed: bool = false, // --prompt-seed: historical prompt-keyed sampling when a request omits its seed
     cache_salt_per_key: bool = false, // --cache-salt-per-key: the matched API key salts each request's prompt cache
