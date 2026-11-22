@@ -42,7 +42,7 @@ pub const Scratch = struct {
 };
 
 /// The kernels the block runs: the captured Triton set, the grouped NVFP4 experts, the plan, and glm_ops.
-pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null };
+pub const Kernels = struct { shared_once: bool = false, set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null };
 
 /// forward.moe_block: out [rows][dims] fp32 partial; `prompt`: 64-pair items, the prompt kernels, bf16 slot rows.
 pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool, out: u64) !void {
@@ -52,6 +52,18 @@ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_st
 
 /// The block up to its fill: the router, the top-k pick, the plan and the routed experts into the slot rows.
 pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
+    try routedBody(k, stream, l, s, x, x_stride, rows, prompt);
+    try prepareShared(k, stream, l, s, x, x_stride, rows, prompt);
+}
+
+/// Only the proven BF16 prompt tile: fixed BM128, one K slice even on a ragged tail.
+pub fn sharedOnce(k: Kernels, l: Layer, prompt: bool) bool {
+    if (!k.shared_once or !prompt or !k.set.prompt or l.exl3 != null or l.routed.format != .nvfp4) return false;
+    if (l.shared_gu != .bf16 or l.shared_down != .bf16) return false;
+    const tiled = k.set.mm orelse return false;
+    return !tiled.prompt_fixed_k;
+}
+fn routedBody(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
     const d = l.routed.dims;
     const slots = l.top_k + 1;
     const shared_id: i32 = @intCast(l.count);
@@ -79,13 +91,27 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const n = hi - lo;
     const bf16_slots = prompt and l.exl3 == null; // the slot rows: bf16 in an NVFP4 prompt chunk, else fp32
     const eb: usize = if (bf16_slots) 2 else 4;
-    try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
-    try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
-    try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+    if (!sharedOnce(k, l, prompt)) try shared(k, stream, l, s, x, x_stride, lo, hi);
     var a: cuda.Args = .{};
     a.add(s.sy + lo * d * 4);
     a.add(s.ey + lo * slots * d * eb);
     for ([_]usize{ n, d, slots, l.top_k, @intFromBool(bf16_slots) }) |v| a.add(@as(c_int, @intCast(v)));
     try cuda_pdl.launch(k.put_slot, .{ .grid = .{ .x = @intCast((n * d + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
     try glue.combine(k.set, stream, s.ey + lo * slots * d * eb, !bf16_slots, s.wts + lo * slots * 4, out, n, d, slots);
+}
+
+/// The original shared expert launches over [lo,hi); the scratch has independent storage for every row.
+pub fn shared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize) !void {
+    const n = hi - lo;
+    const d = l.routed.dims;
+    try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
+    try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
+    try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+}
+
+pub fn prepareShared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
+    if (!sharedOnce(k, l, prompt)) return;
+    const stamp = prof_mod.span(k.prof, stream, .shared_expert);
+    defer stamp.end();
+    try shared(k, stream, l, s, x, x_stride, 0, rows);
 }

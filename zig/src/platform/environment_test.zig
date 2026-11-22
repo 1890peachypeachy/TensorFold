@@ -523,3 +523,15 @@ test "environment: Qwen host GiB cap is strict, bounded and blank as unset" {
     try t.expectEqual(@as(u64, std.math.maxInt(u64) >> 30), try e.value(u64, name, "17179869183", 0));
     for ([_][]const u8{ "0", "-1", "bad", "1.5", "17179869184" }) |raw| try t.expectError(error.InvalidEnvironment, e.value(u64, name, raw, 0));
 }
+
+test "GLM shared prefill environment: exactly one family-scoped flag defaults off" {
+    var count: usize = 0;
+    for (e.rules) |rule| if (std.mem.eql(u8, rule.name, "TF_GLM_PREFILL_SHARED_ONCE")) {
+        count += 1;
+        try t.expectEqual(e.Scope.glm, rule.scope);
+        try t.expectEqual(e.Kind.flag, rule.kind);
+    };
+    try t.expectEqual(@as(usize, 1), count);
+    try t.expect(!try e.value(bool, "TF_GLM_PREFILL_SHARED_ONCE", null, false));
+    try t.expect(try e.value(bool, "TF_GLM_PREFILL_SHARED_ONCE", "1", false));
+}

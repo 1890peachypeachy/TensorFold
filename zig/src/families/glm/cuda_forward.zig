@@ -166,6 +166,7 @@ pub const Forward = struct {
     ranks: []const Rank, // every rank of a local check, or this process's one
     exchange: Exchange,
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE (the Python family's default): decode windows on KDA's three-kernel chain
+    prefill_shared_once: bool = false, // strict opt-in, agreed by all ranks before load
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
@@ -267,11 +268,11 @@ pub const Forward = struct {
     }
 
     fn mlpKernels(f: *const Forward) mlp.Kernels {
-        return .{ .set = f.set(), .linear = .{ .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt }, .copy_rows = f.m.copy_rows };
+        return .{ .shared_once = f.prefill_shared_once and f.ranks[0].w.share.world == 2, .set = f.set(), .linear = .{ .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt }, .copy_rows = f.m.copy_rows };
     }
 
     fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof };
+        return .{ .shared_once = f.prefill_shared_once and f.ranks[0].w.share.world == 2, .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof };
     }
 
     pub const Site = enum { mixer, ffn };

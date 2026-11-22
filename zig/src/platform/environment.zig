@@ -155,6 +155,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_GLM_LINK_WAIT", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_PDL", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_PROMPT_STEPS", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_GLM_PREFILL_SHARED_ONCE", .scope = .glm, .kind = .flag, .forms = "0 or 1 (default 0)" },
     .{ .name = "TF_GLM_SHARED", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_DSEL", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
     .{ .name = "TF_GLM_DSCORES", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
