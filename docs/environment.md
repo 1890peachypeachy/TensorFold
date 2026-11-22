@@ -28,6 +28,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TENSORFOLD_CUDA_KERNELS` | A path without control characters, used as given: a captured kernel set's folder, or `native` for the engine's own kernels. Unset uses the binary's bundled set for the GPU when it has one, else the engine's own kernels. A family that runs only on the engine's own kernels (Qwen3 among them) refuses any other value; Qwen3 reads a blank value as unset |
 | `TF_CUDA_CARVEOUT` | Exactly `0` or `1`; default off |
 | `TF_CUDA_CARVEOUT_MIB` | Positive whole MiB count whose byte size fits the platform, or empty for 1792 MiB |
+| `TF_Q27_DFLASH_TAP_LEAN` | Exactly `0` or `1`; default off. Qwen27 Metal: one completed prompt tap copy into the ring; direct serial prefill may omit whole chunks overwritten before return. Native cache, yield and cancellation boundaries retain their taps |
 | `TF_Q27_COPY_ROWS` | Whole u32 count; zero disables copied rows; default 48 |
 | `TF_Q27_DRAFT_SLOTS` | Whole u32 count, clamped to 1 through the lane stream limit; default 8. DFlash2 can draft for at most the smaller of this count and the admitted streams, and none without a drafter. Under `--mtp-drafts` the MTP head drafts every stream and this does nothing. |
 | `TF_Q27_DFLASH_ADAPTIVE_BLOCK` | Qwen3.8-27B on Metal: exactly `0` or `1`; default 0. `1` lets a lone stream's DFlash2 block narrow from 16 to 8 rows after 8 consecutive rounds landing at most 4 tree drafts, and return to 16 after a round landing 6 or more. Only the drafter's proposal changes. |
