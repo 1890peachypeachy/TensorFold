@@ -56,7 +56,8 @@ pub fn Types(comptime B: type) type {
                     std.fmt.bufPrint(&p.label, "{s}metal glm sparse finite replacement {s}{s}", .{ if (p.rounding) "control: " else "", B.label(p.kind), if (p.rounding) ", one rounding" else "" }) catch unreachable
                 else
                     std.fmt.bufPrint(&p.label, "{s}metal masked-V {s} {s} {s}", .{ if (p.control == .none) "" else "control: ", B.label(p.kind), @tagName(p.poison), if (p.control == .none) "" else @tagName(p.control) }) catch unreachable;
-                return .{ .ctx = p, .vt = &vt, .control = if (p.rounding) .shapes else if (p.control == .none) null else .nonfinite, .spec = .{
+                const identity_supported = if (@hasDecl(B, "identitySupported")) B.identitySupported(p.kind) else true;
+                return .{ .ctx = p, .vt = &vt, .control = if (p.rounding) .shapes else if (p.control == .none) null else .nonfinite, .adversarial = !p.identity and p.control == .none and identity_supported, .spec = .{
                     .name = name,
                     .accum = if (p.identity) .none else .f32,
                     .depth = depth,
@@ -81,6 +82,7 @@ pub fn Types(comptime B: type) type {
                 geo.first = shape.k;
                 p.fixture = try data.Data.init(p.arena.?.allocator(), geo, shape.rows, fill == .nonfinite, p.poison);
                 if (p.identity and fill == .random) p.fixture.finite(seed);
+                if (!p.identity and ct.identity.requested(seed)) p.fixture.plantIdentity();
                 try B.prepare(p);
                 if (p.identity and fill == .random) p.base_out = try p.rig.scratch(p.fixture.count() * c.size(B.output(p.kind)));
                 return true;
@@ -164,8 +166,8 @@ pub fn Types(comptime B: type) type {
             kernels: *std.ArrayList(g.Kernel),
             probes: std.ArrayList(*Probe) = .empty,
             pub fn collect(s: *Suite, only: ?[]const u8) !void {
-                if (!s.device.tensorUnits()) return;
                 for (std.enums.values(B.Kind)) |kind| {
+                    if (@hasDecl(B, "portable") and !s.device.tensorUnits() and !B.portable(kind)) continue;
                     if (!B.available(kind)) {
                         std.debug.print("MASKED_UNAVAILABLE {s}: source absent from this tree\n", .{B.label(kind)});
                         continue;
