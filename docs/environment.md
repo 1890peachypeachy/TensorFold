@@ -57,6 +57,9 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TF_HEAD_GEOMETRY` | Whole native-size nonnegative geometry count in the head benchmark |
 | `TF_ROCE_GID_INDEX` | Whole index 0 through 2147483647; unset searches for a RoCE v2 IPv4 GID |
 | `TF_QWEN35_CHUNK_SOLO` | Qwen 3.5/3.6/3.8 on CUDA: 4096 or 8192 rows a foreground prompt pass while no other stream decodes (a background warm pass keeps 4096); unset, empty or 4096 is off, with main's scratch. Checked when the model loads, with the family's own message |
+| `TF_Q35_SKIP_XS` | Exactly `0` or `1`; default off. On a ModelOpt CUDA target, `1` suppresses norm and glue group-sum writes that its projections do not consume. Affine drafts and learning keep their required writes |
+| `TF_Q35_ACTIVE_TABLES` | Exactly `0` or `1`; default off. `1` uploads only active recorded-verify table spans from stable pinned storage; prompts and default uploads are unchanged |
+| `TF_Q35_CAPTURE` | Exactly `0` or `1`; default off. `1` captures uniform landing draws and immediate prefix keeps. Mixed draws, deferred keeps, rollback, one-row keeps and compaction stay eager |
 | `TF_GEMMA4_CHUNK_SOLO` | Gemma 4 on CUDA: a multiple of 512 from 512 through 4096; unset, empty or 512 is off. Checked when the model loads, with the family's own message |
 | `TF_GEMMA4_ARGMAX_GRAPH` | Gemma 4 on CUDA: exactly `0` or `1`; default off. `1` captures a greedy verify round's argmax (the same `tf_round_bf16_argmax` over the same logits) in the target forward's graph, skips the drawn-token download no greedy entry reads, and stages each forward's ids, positions and slots in pinned memory; target tokens keep their bits |
 | `TF_DRAMA_PREFILL_ROWS` | Drama 3 on CUDA: whole prompt rows a chunk, 1 through 1024; default 1. Checked when the checkpoint opens, with its own message |
