@@ -582,6 +582,7 @@ pub fn main(init: std.process.Init) !u8 {
         try g.runAll(a, kernels.items, o.seed, &t);
         for (flash_list[0..flash_made]) |*probe| try probe.rowCountInvariant();
         try dsv41_suites.gates(init.io, o.seed, &t);
+        try @import("metal_gemma4_fuse_rows.zig").gates(a, device, queue, o.only, o.seed, &t);
     }
     const t1 = std.Io.Clock.awake.now(init.io);
     var lim: usize = 0;
