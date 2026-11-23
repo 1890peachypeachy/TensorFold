@@ -27,6 +27,7 @@ pub const Model = struct {
     weights: wts.Weights,
     kernels: quant.Kernels,
     glue: glue.Kernels,
+    tap_ring: ?mtl.Pipeline = null,
     /// The routed block's kernels, with experts.
     moe: ?moe_gpu.Kernels = null,
     frame: Frame,
@@ -145,8 +146,10 @@ pub const Model = struct {
         const pipelines = timing.span(.weight_pipelines);
         m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits(), .long_prompt = quant.longPrompt(std.mem.span(m.device.name()), m.device.tensorUnits()) };
         errdefer m.kernels.deinit();
-        m.glue = try glue.Kernels.init(m.device);
+        m.tap_ring = null;
+        m.glue = try glue.Kernels.init(m.device, &m.tap_ring);
         errdefer m.glue.deinit();
+        errdefer if (m.tap_ring) |p| p.deinit();
         m.moe = if (c.moe()) try moe_gpu.Kernels.init(a, m.device) else null;
         errdefer if (m.moe) |*k| k.deinit();
         pipelines.end();
@@ -224,6 +227,7 @@ pub const Model = struct {
         m.frame.deinit();
         if (m.moe) |*k| k.deinit();
         m.glue.deinit();
+        if (m.tap_ring) |p| p.deinit();
         m.kernels.deinit();
         m.weights.deinit();
         m.checkpoint.deinit();
