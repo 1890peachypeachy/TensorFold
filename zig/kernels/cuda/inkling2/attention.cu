@@ -52,7 +52,7 @@ __device__ __forceinline__ void prepRow(const uint16_t* __restrict__ q_raw, cons
                                         const int* __restrict__ rpos, const int* __restrict__ rseg,
                                         const Seg* __restrict__ segs, uint16_t* __restrict__ q_out,
                                         uint16_t* __restrict__ rel_out, uint16_t* __restrict__ kc,
-                                        const uint16_t* __restrict__ vc, int heads, int kv_heads, int ring, int global,
+                                        uint16_t* __restrict__ vc, int heads, int kv_heads, int ring, int global,
                                         float qk_clip, float rel_clip, float floor_pos, float alpha, float eps) {
 
     const int row = blockIdx.x, y = blockIdx.y, lane = threadIdx.x;
