@@ -312,7 +312,6 @@ fn drafterRefusal(a: Allocator, dir: []const u8, drafter: []const u8, err: anyer
     if (err == error.DraftForAnotherTarget) return std.fmt.allocPrint(a, "--drafter {s} drafts for another target: its width, vocabulary or tapped layers do not fit {s} (DraftForAnotherTarget)", .{ drafter, dir });
     return std.fmt.allocPrint(a, "--drafter {s} is not a drafter the native Qwen engine serves for {s} ({s}): it takes z-lab/Qwen3.8-27B-DFlash2 as released, for Qwen3.8-27B", .{ drafter, dir, @errorName(err) });
 }
-
 /// A loaded model served as `open` serves one, `drafter` bound in place of `o.drafter`; both stay the caller's.
 pub fn attach(parent: Allocator, io: std.Io, model: *q.model.Model, drafter: ?*q.dflash.runtime_model.Model, o: Options, a: Allocator, why: *[]const u8) !*Host {
     const setup = tf.startup_receipt.span(.runtime_setup);
