@@ -95,7 +95,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_nemo_attn_chunk(const __nv_
                 ps[g][jj + 16 * u] = p;
                 local = __fadd_rn(local, p);
             }
-            den = (same && isfinite(__fadd_rn(den, half_sum(local)))) ? __fadd_rn(den, half_sum(local)) : __fmaf_rn(den, alpha, half_sum(local));
+            const float sum = half_sum(local);
+            den = (same && isfinite(__fadd_rn(den, sum))) ? __fadd_rn(den, sum) : __fmaf_rn(den, alpha, sum);
             m = next;
             __syncthreads();
             float pv[8];
@@ -273,7 +274,8 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_nemo_attn_chunk_pf(const
                 ps[g][jj + 16 * u] = p;
                 local = __fadd_rn(local, p);
             }
-            den = (same && isfinite(__fadd_rn(den, half_sum(local)))) ? __fadd_rn(den, half_sum(local)) : __fmaf_rn(den, alpha, half_sum(local));
+            const float sum = half_sum(local);
+            den = (same && isfinite(__fadd_rn(den, sum))) ? __fadd_rn(den, sum) : __fmaf_rn(den, alpha, sum);
             m = next;
             __syncthreads();
             float pv[8];

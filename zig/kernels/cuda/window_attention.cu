@@ -219,8 +219,9 @@ __device__ __forceinline__ bool wattn_rows(const __nv_bfloat16* __restrict__ q, 
                 c0[n] = __fadd_rn(sc[n][0], sc[n][1]);
                 c1[n] = __fadd_rn(sc[n][2], sc[n][3]);
             }
-            l0 = (same0 && isfinite(__fadd_rn(l0, rowsum(c0)))) ? __fadd_rn(l0, rowsum(c0)) : __fmaf_rn(l0, a0, rowsum(c0));
-            l1 = (same1 && isfinite(__fadd_rn(l1, rowsum(c1)))) ? __fadd_rn(l1, rowsum(c1)) : __fmaf_rn(l1, a1, rowsum(c1));
+            const float sum0 = rowsum(c0), sum1 = rowsum(c1);
+            l0 = (same0 && isfinite(__fadd_rn(l0, sum0))) ? __fadd_rn(l0, sum0) : __fmaf_rn(l0, a0, sum0);
+            l1 = (same1 && isfinite(__fadd_rn(l1, sum1))) ? __fadd_rn(l1, sum1) : __fmaf_rn(l1, a1, sum1);
             m0 = n0;
             m1 = n1;
 #pragma unroll

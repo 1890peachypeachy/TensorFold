@@ -429,8 +429,8 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
 #pragma unroll
             for (int q = 0; q < 8; ++q)
 #pragma unroll
-                for (int e = 0; e < 2; ++e) oo[FUSE ? q : 0][2 * h + e] = (same && isfinite(__fadd_rn(oo[FUSE ? q : 0][2 * h + e], __fmul_rn(o[q][2 * h + e], bb)))) ? __fadd_rn(oo[FUSE ? q : 0][2 * h + e], __fmul_rn(o[q][2 * h + e], bb)) : __fmaf_rn(o[q][2 * h + e], bb, __fmul_rn(oo[FUSE ? q : 0][2 * h + e], a));
-            ll[h] = (same && isfinite(__fadd_rn(ll[h], __fmul_rn(l[h], bb)))) ? __fadd_rn(ll[h], __fmul_rn(l[h], bb)) : __fmaf_rn(l[h], bb, __fmul_rn(ll[h], a));
+                for (int e = 0; e < 2; ++e) oo[FUSE ? q : 0][2 * h + e] = (same && isfinite(__fmaf_rn(o[q][2 * h + e], bb, oo[FUSE ? q : 0][2 * h + e]))) ? __fmaf_rn(o[q][2 * h + e], bb, oo[FUSE ? q : 0][2 * h + e]) : __fmaf_rn(o[q][2 * h + e], bb, __fmul_rn(oo[FUSE ? q : 0][2 * h + e], a));
+            ll[h] = (same && isfinite(__fmaf_rn(l[h], bb, ll[h]))) ? __fmaf_rn(l[h], bb, ll[h]) : __fmaf_rn(l[h], bb, __fmul_rn(ll[h], a));
             mm[h] = next;
         }
         continue;
@@ -554,8 +554,8 @@ __device__ __forceinline__ void fn_attn_merge_body(const float* __restrict__ PO,
             const float next = active ? fmaxf(m, cm) : m;
             const bool same = TF_CUDA_SOFTMAX_IDENTITY_GUARD && isfinite(next) && next == m; const float a = same ? 1.0f : (active ? (m == -INFINITY ? 0.0f : tf_exp(__fsub_rn(m, next))) : 1.0f);
             const float b = active ? tf_exp(__fsub_rn(cm, next)) : 0.0f;
-            o = (same && isfinite(__fadd_rn(o, __fmul_rn(co, b)))) ? __fadd_rn(o, __fmul_rn(co, b)) : __fmaf_rn(co, b, __fmul_rn(o, a));
-            l = (same && isfinite(__fadd_rn(l, __fmul_rn(cl, b)))) ? __fadd_rn(l, __fmul_rn(cl, b)) : __fmaf_rn(cl, b, __fmul_rn(l, a));
+            o = (same && isfinite(__fmaf_rn(co, b, o))) ? __fmaf_rn(co, b, o) : __fmaf_rn(co, b, __fmul_rn(o, a));
+            l = (same && isfinite(__fmaf_rn(cl, b, l))) ? __fmaf_rn(cl, b, l) : __fmaf_rn(cl, b, __fmul_rn(l, a));
             m = next;
         }
         OUT[(static_cast<long long>(r) * H + head) * HD + d] = __float2bfloat16_rn(__fdiv_rn(o, l));

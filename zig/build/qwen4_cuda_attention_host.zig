@@ -19,8 +19,8 @@ fn restoreTile(a: std.mem.Allocator, source: []const u8) ![]u8 {
         .{ "l[h] = (same[h] && isfinite(__fadd_rn(l[h], sum))) ? __fadd_rn(l[h], sum) : __fmaf_rn(l[h], alpha[h], sum);", "l[h] = __fmaf_rn(l[h], alpha[h], sum);" },
         .{ "for (int e = 0; e < 4; ++e) if (!same[e >> 1] || !isfinite(o[q][e])) o[q][e] = __fmul_rn(o[q][e], alpha[e >> 1]);", "for (int e = 0; e < 4; ++e) o[q][e] = __fmul_rn(o[q][e], alpha[e >> 1]);" },
         .{ "const bool same = TF_CUDA_SOFTMAX_IDENTITY_GUARD && isfinite(next) && next == mm[h]; const float a = same ? 1.0f : (active ? (mm[h] == -INFINITY ? 0.0f : tf_exp(__fsub_rn(mm[h], next))) : 1.0f);", "const float a = active ? (mm[h] == -INFINITY ? 0.0f : tf_exp(__fsub_rn(mm[h], next))) : 1.0f;" },
-        .{ "for (int e = 0; e < 2; ++e) oo[FUSE ? q : 0][2 * h + e] = (same && isfinite(__fadd_rn(oo[FUSE ? q : 0][2 * h + e], __fmul_rn(o[q][2 * h + e], bb)))) ? __fadd_rn(oo[FUSE ? q : 0][2 * h + e], __fmul_rn(o[q][2 * h + e], bb)) : __fmaf_rn(o[q][2 * h + e], bb, __fmul_rn(oo[FUSE ? q : 0][2 * h + e], a));", "for (int e = 0; e < 2; ++e) oo[FUSE ? q : 0][2 * h + e] = __fmaf_rn(o[q][2 * h + e], bb, __fmul_rn(oo[FUSE ? q : 0][2 * h + e], a));" },
-        .{ "ll[h] = (same && isfinite(__fadd_rn(ll[h], __fmul_rn(l[h], bb)))) ? __fadd_rn(ll[h], __fmul_rn(l[h], bb)) : __fmaf_rn(l[h], bb, __fmul_rn(ll[h], a));", "ll[h] = __fmaf_rn(l[h], bb, __fmul_rn(ll[h], a));" },
+        .{ "for (int e = 0; e < 2; ++e) oo[FUSE ? q : 0][2 * h + e] = (same && isfinite(__fmaf_rn(o[q][2 * h + e], bb, oo[FUSE ? q : 0][2 * h + e]))) ? __fmaf_rn(o[q][2 * h + e], bb, oo[FUSE ? q : 0][2 * h + e]) : __fmaf_rn(o[q][2 * h + e], bb, __fmul_rn(oo[FUSE ? q : 0][2 * h + e], a));", "for (int e = 0; e < 2; ++e) oo[FUSE ? q : 0][2 * h + e] = __fmaf_rn(o[q][2 * h + e], bb, __fmul_rn(oo[FUSE ? q : 0][2 * h + e], a));" },
+        .{ "ll[h] = (same && isfinite(__fmaf_rn(l[h], bb, ll[h]))) ? __fmaf_rn(l[h], bb, ll[h]) : __fmaf_rn(l[h], bb, __fmul_rn(ll[h], a));", "ll[h] = __fmaf_rn(l[h], bb, __fmul_rn(ll[h], a));" },
     };
     var out = source;
     for (edits) |pair| out = try edit.once(a, out, pair[0], pair[1]);
@@ -29,8 +29,8 @@ fn restoreTile(a: std.mem.Allocator, source: []const u8) ![]u8 {
 fn restoreMerge(a: std.mem.Allocator, source: []const u8) ![]u8 {
     const edits = [_][2][]const u8{
         .{ "const bool same = TF_CUDA_SOFTMAX_IDENTITY_GUARD && isfinite(next) && next == m; const float a = same ? 1.0f : (active ? (m == -INFINITY ? 0.0f : tf_exp(__fsub_rn(m, next))) : 1.0f);", "const float a = active ? (m == -INFINITY ? 0.0f : tf_exp(__fsub_rn(m, next))) : 1.0f;" },
-        .{ "o = (same && isfinite(__fadd_rn(o, __fmul_rn(co, b)))) ? __fadd_rn(o, __fmul_rn(co, b)) : __fmaf_rn(co, b, __fmul_rn(o, a));", "o = __fmaf_rn(co, b, __fmul_rn(o, a));" },
-        .{ "l = (same && isfinite(__fadd_rn(l, __fmul_rn(cl, b)))) ? __fadd_rn(l, __fmul_rn(cl, b)) : __fmaf_rn(cl, b, __fmul_rn(l, a));", "l = __fmaf_rn(cl, b, __fmul_rn(l, a));" },
+        .{ "o = (same && isfinite(__fmaf_rn(co, b, o))) ? __fmaf_rn(co, b, o) : __fmaf_rn(co, b, __fmul_rn(o, a));", "o = __fmaf_rn(co, b, __fmul_rn(o, a));" },
+        .{ "l = (same && isfinite(__fmaf_rn(cl, b, l))) ? __fmaf_rn(cl, b, l) : __fmaf_rn(cl, b, __fmul_rn(l, a));", "l = __fmaf_rn(cl, b, __fmul_rn(l, a));" },
     };
     var out = source;
     for (edits) |pair| out = try edit.once(a, out, pair[0], pair[1]);
