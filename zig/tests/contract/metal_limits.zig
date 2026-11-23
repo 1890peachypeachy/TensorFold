@@ -46,7 +46,7 @@ pub fn requireMapped(d: limits.MetalLaunch) !void {
 /// Only launches the loader can build on this device enter the limits compiler; declarations are checked first.
 pub fn supported(device: mtl.Device, d: limits.MetalLaunch) bool {
     if (std.mem.startsWith(u8, d.name, "qwen27 prompt ")) {
-        const causal = std.mem.indexOf(u8, d.name, " tensor ") != null or std.mem.indexOf(u8, d.name, " simd ") != null;
+        const causal = std.mem.indexOf(u8, d.name, " tensor ") != null;
         const units = std.mem.indexOf(u8, d.name, " m5 ") != null or std.mem.indexOf(u8, d.name, " tensor ") != null;
         if (causal and units) return @import("metal_support.zig").tensor(device.tensorUnits(), d.name);
         return device.tensorUnits() == units;
@@ -71,12 +71,12 @@ fn resolve(a: std.mem.Allocator, device: mtl.Device, d: limits.MetalLaunch, comp
     }
     if (std.mem.startsWith(u8, d.name, "qwen27 prompt ")) {
         if (!assemble) return undefined;
-        const legacy = std.mem.indexOf(u8, d.name, " tensor ") != null or std.mem.indexOf(u8, d.name, " simd ") != null;
-        const units = std.mem.indexOf(u8, d.name, " m5 ") != null or std.mem.indexOf(u8, d.name, " tensor ") != null;
+        const causal = std.mem.indexOf(u8, d.name, " tensor ") != null;
+        const units = std.mem.indexOf(u8, d.name, " m5 ") != null or causal;
         const paged = std.mem.indexOf(u8, d.name, " paged ") != null;
         const form = for (@import("contract").q27_prompt.forms) |f| {
             if (std.mem.indexOf(u8, d.name, f.tag) != null) break f;
-        } else if (legacy) @import("contract").q27_prompt.forms[0] else return error.UnknownLaunch;
+        } else if (causal) @import("contract").q27_prompt.forms[0] else return error.UnknownLaunch;
         const text_here = try tf.qwen27.simd_attention.grouped(a, units, true, form.group, form.kv_heads, paged);
         return .{ .decl = d, .function = fun, .here = text_here, .pre_m5 = if (units) "" else text_here };
     }
