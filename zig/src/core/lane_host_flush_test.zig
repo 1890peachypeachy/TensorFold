@@ -51,6 +51,7 @@ const Box = struct {
                 b.flushed_at_prefill = answered;
                 b.peer_ended_at_prefill = if (b.peer) |p| p.ended.load(.acquire) else null;
             },
+            .progress => {},
             .logprobs, .prompt_logprobs, .audio => {},
             .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
             .finished => |f| {
