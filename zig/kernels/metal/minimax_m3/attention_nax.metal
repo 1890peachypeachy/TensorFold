@@ -36,19 +36,40 @@ using PT = float;
 
 template <bool TR, typename T>
 inline frag<bfloat> blk(const device T* p, int ld, int r, int c, short2 home) {
+#ifndef TF_SIMD_FRAGS
   const device T* q = p + (r + home.y) * ld + c + home.x;
   return frag<bfloat>(bfloat4(*(const device vec<T, 4>*)q), bfloat4(*(const device vec<T, 4>*)(q + 8 * ld)));
+#else
+  frag<bfloat> f;
+  if (TR) {
+    frag_get_t(f, p, ld, r, c, home);
+  } else {
+    frag_get(f, p, ld, r, c, home);
+  }
+  return f;
+#endif
 }
 
 inline frag<PT> prob_frag(const threadgroup PT* pt, int r, int c, short2 home) {
+#ifndef TF_SIMD_FRAGS
   const threadgroup PT* q = pt + (r + home.y) * PP + c + home.x;
   return frag<PT>(*(const threadgroup vec<PT, 4>*)q, *(const threadgroup vec<PT, 4>*)(q + 8 * PP));
+#else
+  frag<PT> f;
+  frag_get(f, pt, PP, r, c, home);
+  return f;
+#endif
 }
 
 inline void prob_put(threadgroup PT* pt, int r, int c, short2 home, thread const frag<float>& s) {
+#ifndef TF_SIMD_FRAGS
   threadgroup PT* q = pt + (r + home.y) * PP + c + home.x;
   *(threadgroup vec<PT, 4>*)q = vec<PT, 4>(s[0], s[1], s[2], s[3]);
   *(threadgroup vec<PT, 4>*)(q + 8 * PP) = vec<PT, 4>(s[4], s[5], s[6], s[7]);
+#else
+  TF_UNROLL
+  for (short e = 0; e < 8; e++) pt[(r + home.y + (e >> 2) * 8) * PP + c + home.x + TF_COL(e)] = PT(s[e]);
+#endif
 }
 
 // Q, O [R, NQ, DH] at P.y..; K, V the cache; SEL: a row's key head keeps block b; a tile: G heads on RT / G rows.

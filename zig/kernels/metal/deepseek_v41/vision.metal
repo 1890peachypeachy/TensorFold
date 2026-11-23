@@ -6,7 +6,9 @@
 using namespace metal;
 #pragma clang fp contract(off)
 
+#ifndef TF_CTL
 #define TF_CTL 0 // planted faults 1 to 6, one per kernel; 0 is the kernel as served
+#endif
 
 inline float tf_vis_bf(float v) {
   return float(bfloat(v));

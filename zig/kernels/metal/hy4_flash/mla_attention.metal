@@ -173,7 +173,7 @@ kernel void tf_hy4_attend_scored(
                 for (uint t = 0; t < tn; ++t) {
                     const threadgroup ushort *kv_row = (const threadgroup ushort *)&tile[t][0];
                     const float pt = simd_shuffle(p, ushort(h + t)), ot = simd_shuffle(old, ushort(h + t));
-                    const bool st = ot == 1.0f;
+                    const bool st = TF_METAL_SOFTMAX_IDENTITY_GUARD && ot == 1.0f;
                     denom = st ? denom + pt : fma(denom, ot, pt);
                     for (uint i = 0; i < 16; ++i) accum[i] = fma(pt, hy4_float(kv_row[latent_col + i]), st ? accum[i] : accum[i] * ot);
                 }

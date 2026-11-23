@@ -108,6 +108,7 @@ inline float bsig(float x) { return float(bfloat(1.0f / (1.0f + metal::exp(-x)))
       const int j = j0 + 16 * (i >> 2) + home.x + TF_COL(i & 3);
       kq[i] = j < n ? (sparse ? ids[j] : j) : 0;
     }
+#endif
     // this simdgroup's dims of q . k for the 32 keys
     frag<float> s[2] = {frag<float>(0), frag<float>(0)};
     TF_UNROLL
@@ -119,6 +120,11 @@ inline float bsig(float x) { return float(bfloat(1.0f / (1.0f + metal::exp(-x)))
         const int c = 16 * d + home.y + (e >> 2) * 8;
         k0[e] = Kh[long(kq[e & 3]) * D + c];
         k1[e] = Kh[long(kq[4 + (e & 3)]) * D + c];
+#else
+        const int c = 16 * d + home.x + (e & 3);
+        k0[e] = Kh[long(key[(e >> 2)]) * D + c];
+        k1[e] = Kh[long(key[2 + (e >> 2)]) * D + c];
+#endif
       }
       mma_16x32<false, true>(s[0], s[1], q[d], k0, k1);
     }

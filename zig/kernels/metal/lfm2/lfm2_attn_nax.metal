@@ -118,7 +118,7 @@ inline float lfm2_nax_rowsum(float v) {
         m[r] = m2[r];
       }
       for (int i = 0; i < 4; ++i)
-        for (short e = 0; e < 8; ++e) if (alpha[e >> 2] != 1.0f || !isfinite(o[i][e])) o[i][e] *= alpha[e >> 2];
+        for (short e = 0; e < 8; ++e) if (!TF_METAL_SOFTMAX_IDENTITY_GUARD || alpha[e >> 2] != 1.0f || !isfinite(o[i][e])) o[i][e] *= alpha[e >> 2];
       for (int h = 0; h < 2; ++h) {
         frag<bfloat> v0, v1, v2, v3;
         frag_get_tg(v0, vsb, NP, 16 * h, 0, home);

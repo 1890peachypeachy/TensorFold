@@ -12,7 +12,9 @@
 using namespace metal;
 #pragma clang fp contract(off)
 
+#ifndef TF_CTL
 #define TF_CTL 0
+#endif
 
 #define TF_ATTN_D 512u
 #define TF_ATTN_WIN 128u

@@ -10,7 +10,9 @@ constant constexpr uint L3PER = 4096;
 constant constexpr uint L3PART = 1024;
 struct lfm3_attn_args { uint len, cap; float scale; uint window, chunk_base; };
 
+#ifndef L3_ATTN_ACC
 #define L3_ATTN_ACC float
+#endif
 
 inline float lfm3_attention_dot(const thread float* q, const device bfloat* k) {
   L3_ATTN_ACC dot = 0.0f;
@@ -21,6 +23,9 @@ inline float lfm3_attention_dot(const thread float* q, const device bfloat* k) {
 // Rare-path range extension only: FP32 mantissas, integer exponents, no precision reduction.
 #ifdef L3_RANGE_SKIP_REPAIR
 constant constexpr bool L3_RANGE_REPAIR_ENABLED=false;
+#else
+constant constexpr bool L3_RANGE_REPAIR_ENABLED=true;
+#endif
 struct l3_x { float m; int e; };
 inline l3_x l3_x_bits(uint u) {
  const uint sign=u&0x80000000u,be=(u>>23)&255u,fr=u&0x7fffffu;
@@ -184,6 +189,7 @@ inline void lfm3_attention_partial(const device bfloat* queries, const device bf
   if (lane == 0) { pm[target] = merged_max; pl[target] = merged_total; range_flags[target]=chunk_risk;
 #ifdef L3_RANGE_CLEAR_RISK
   range_flags[target]=0u;
+#endif
  }
   for (uint j = 0; j < 4; ++j) po[target * 128 + lane + 32 * j] = merged[j];
 }
@@ -302,5 +308,6 @@ struct lfm3_attn_segment { ulong keys, values; uint base, rows; lfm3_attn_args a
   }
 #ifdef L3_SEGMENT_BAD_TAIL
   if (tg.y + 1 == seg.base + seg.rows) return;
+#endif
   for (uint j = 0; j < 4; ++j) y[(size_t(tg.y) * 16 + tg.x) * 128 + lane + 32 * j] = bfloat(result[j] / total);
 }

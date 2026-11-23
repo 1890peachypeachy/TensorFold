@@ -318,7 +318,7 @@ inline void lfm2_attn_rows(const device bfloat* queries, const device bfloat* ke
         m[b] = m2;
       }
       for (int d = 0; d < 8; ++d) {
-        for (int b = 0; b < RB; ++b) if (alpha[b] != 1.0f || !isfinite(o[b][d])) o[b][d] *= alpha[b];
+        for (int b = 0; b < RB; ++b) if (!TF_METAL_SOFTMAX_IDENTITY_GUARD || alpha[b] != 1.0f || !isfinite(o[b][d])) o[b][d] *= alpha[b];
         for (uint t = 0; t < 4; ++t) {
           const vec<bfloat, 2> v = *(const threadgroup vec<bfloat, 2>*)(vsb + (8 * t + fm) * KP + 8 * d + fn);
           for (int b = 0; b < RB; ++b) o[b][d] = lfm2_mma(o[b][d], pb[b][t], v);

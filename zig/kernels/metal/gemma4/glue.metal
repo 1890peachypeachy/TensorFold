@@ -22,6 +22,17 @@ inline uint2 gemma_codes(const device uchar* weight, size_t id, uint b) {
 #if EB == 4
   const uchar v = weight[id * (D / 2) + b];
   return uint2(v & 0xf, v >> 4);
+#else
+  const device uchar* row = weight + id * (D * EB / 8);
+  uint2 out;
+  for (uint j = 0; j < 2; j++) {
+    const uint bit = (2 * b + j) * EB, at = bit / 8, sh = bit % 8;
+    uint v = uint(row[at]) >> sh;
+    if (sh + EB > 8) v |= uint(row[at + 1]) << (8 - sh);
+    out[j] = v & ((1u << EB) - 1u);
+  }
+  return out;
+#endif
 }
 
 // Embedding rows of the EB-bit table times the bf16 embedding scale: MLX's dequantize, then a bf16 multiply.

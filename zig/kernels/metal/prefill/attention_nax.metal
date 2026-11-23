@@ -47,6 +47,9 @@ inline void attention_pv(thread frag<float>& lo, thread frag<float>& hi, thread 
       lo[4 + c] = fma(p1, a, lo[4 + c]); hi[4 + c] = fma(p1, b, hi[4 + c]);
     }
   }
+#else
+  mma_16x32<false, false>(lo, hi, p, v0, v1);
+#endif
 }
 
 // One 64-query block of one head, online softmax over 32-key blocks; P holds the ATTN_PARAMS fields, F[0] the scale.

@@ -14,6 +14,10 @@ using namespace metal;
 #if TF_D == 128
 typedef float4 glm_vec;
 typedef bfloat4 glm_bvec;
+#else
+typedef float2 glm_vec;
+typedef bfloat2 glm_bvec;
+#endif
 
 // Rows: streams' blocks; stream s's keys: its context at ring slots (at + key) % window, then its own KO/VO rows.
 struct glm_draft_args { uint rows, block, streams, mask_stride, scale_bits, window, chunks, pad; };

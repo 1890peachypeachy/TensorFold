@@ -165,14 +165,14 @@ inline void hy4_attend_nax(const device bfloat* query, const device bfloat* cach
         for (int i = 0; i < 2; ++i) {
             sum[i] += simd_shuffle_xor(sum[i], ushort(1));
             sum[i] += simd_shuffle_xor(sum[i], ushort(8));
-            l[i] = (alpha[i] == 1.0f ? l[i] : l[i] * alpha[i]) + sum[i];
+            l[i] = (TF_METAL_SOFTMAX_IDENTITY_GUARD && alpha[i] == 1.0f ? l[i] : l[i] * alpha[i]) + sum[i];
         }
         TF_UNROLL
         for (int j = 0; j < 4; ++j) {
             TF_UNROLL
             for (short e = 0; e < 8; e++) {
-                if (alpha[e >> 2] != 1.0f) o[j][0][e] *= alpha[e >> 2];
-                if (alpha[e >> 2] != 1.0f) o[j][1][e] *= alpha[e >> 2];
+                if (!TF_METAL_SOFTMAX_IDENTITY_GUARD || alpha[e >> 2] != 1.0f) o[j][0][e] *= alpha[e >> 2];
+                if (!TF_METAL_SOFTMAX_IDENTITY_GUARD || alpha[e >> 2] != 1.0f) o[j][1][e] *= alpha[e >> 2];
             }
             const int n = int(sg) * 128 + j * 32;
             frag<bfloat> v0, v1;

@@ -94,7 +94,7 @@
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     H3_UNROLL
-    for (ushort i = 0; i < C2; i++) if (fac[orow[i]] != 1.0f) out[i] *= fac[orow[i]];
+    for (ushort i = 0; i < C2; i++) if (!TF_METAL_SOFTMAX_IDENTITY_GUARD || fac[orow[i]] != 1.0f) out[i] *= fac[orow[i]];
     auto vb = v.slice<D, KEYS>(0, k0);
     op2.run(p, vb, out);
     threadgroup_barrier(mem_flags::mem_threadgroup);

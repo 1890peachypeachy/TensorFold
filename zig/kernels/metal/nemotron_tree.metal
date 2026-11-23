@@ -141,6 +141,13 @@ template <int H, int DH, int NG, int DS, int XD, int PROJ, int DTOFF, int SSZ>
 #define TT_HI(i, n) (((i) & ((n) / 4)) != 0)
 #define TT_HALF(hh, i) (((i) & 1) | ((4 * (hh) + (((i) >> 1) & 3)) << 1) | (((i) & 8) << 1))
 #define TT_Y(b, k, hi) ((hi) * (TK / 4) + (b) * 4 + (k))
+#else
+#define TT_FN(lane) short(((((lane) >> 2) & 2) | ((lane) & 1)) * 4)
+#define TT_COL(i, n) (((i) >> 3) * 16 + ((i) & 3))
+#define TT_HI(i, n) (((i) & 4) != 0)
+#define TT_HALF(hh, i) ((hh) * 16 + (i))
+#define TT_Y(b, k, hi) ((b) * 8 + (hi) * 4 + (k))
+#endif
 
 // A node's keys past the shared pass, gathered by logical position (dims: P, PT, NCA, NCB, NT): one-row step's sums.
 template <int G, int D, int CK, int TK, int MAXD>
