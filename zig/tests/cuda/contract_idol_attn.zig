@@ -123,14 +123,14 @@ pub const Attn = struct {
         if (tile == 0) return;
         const spots = [3]usize{ tile - 1, tile, @min(2 * tile, t.tokens - 1) };
         for (spots, 0..) |j, i| {
-            const k = t.at(j, 1, 0, 0);
+            const k = t.qkv.items[j * t.stride() + t.heads * r.D ..];
             k[0] = half(if (i < 2) 16 else 32);
             k[1] = 0x8000;
             k[2] = 0x0001;
             k[3] = 0x8001;
             k[4] = 0x03ff;
             k[5] = 0x83ff;
-            const v = t.at(j, 2, 0, 0);
+            const v = t.qkv.items[j * t.stride() + 2 * t.heads * r.D ..];
             v[0] = half(1 + 2 * @as(f64, @floatFromInt(i)));
             v[1] = if (i == 0) 0x8000 else 0;
             v[2] = if (i == 0) 0x0001 else 0x8001;
