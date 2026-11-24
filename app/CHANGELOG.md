@@ -8,6 +8,7 @@ See the [engine changelog](../CHANGELOG.md) for engine releases.
 These are highlights from changes merged after Desktop 1.0.0. They are available in builds from
 current source and are awaiting a packaged Desktop release.
 
+- The New Project Folder row keeps **Browse** on one line while the folder input shrinks. (#4403)
 - Search in **Current conversation** ignores the project filter from **All saved conversations**.
   Switching back restores the selected project. [#3900](https://github.com/ashhart/TensorFold/pull/3900)
 - **Planning only** opens the model picker on **Local**. The regular model button opens **All**.
