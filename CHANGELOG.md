@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Nemotron 3.5 Super on CUDA at TP=2: the expert rank runs a window's shared expert on a side stream beside its routed experts, with the same plans and kernels, so tokens are unchanged (#4886).
+
 - Hy4-flash: host-side weight map, TP=1/2/4 partition and Engram FP8 row codec for the official W8A16 FP8 checkpoint, with refusal tests; serving follows in later PRs (#4827). Thanks @GrgaPalcic.
 
 - TP: the 4-rank RoCE ring relay forwards each half as soon as it arrives, lowering gather latency with the opt-in relay; bytes are unchanged (#4798). Thanks @GrgaPalcic.
