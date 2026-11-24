@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Qwen 3.5/3.6/3.8 on CUDA with MTP drafts: cold prompt chunks that end before the MTP head's first tapped row skip the last layer's unread rows and the head, as chunks without taps already did; tokens unchanged (#4882).
+
 - Hy4-flash: host-side weight map, TP=1/2/4 partition and Engram FP8 row codec for the official W8A16 FP8 checkpoint, with refusal tests; serving follows in later PRs (#4827). Thanks @GrgaPalcic.
 
 - TP: the 4-rank RoCE ring relay forwards each half as soon as it arrives, lowering gather latency with the opt-in relay; bytes are unchanged (#4798). Thanks @GrgaPalcic.
