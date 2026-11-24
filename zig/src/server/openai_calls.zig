@@ -17,8 +17,9 @@ pub fn attach(r: anytype, reply: *chat.Reply) Allocator.Error!?[]Value {
         const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse return null;
         reply.content = try r.plan.policy.parsedContent(r.a, reply.content);
         reply.finish_reason = finished(reply.finish_reason);
-        reply.tool_calls_streamed = false;
-        return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
+        const kept = if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
+        try complete(r, reply, kept, null);
+        return kept;
     }
     const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
     if (parsed.rejected_envelopes > 0) {
@@ -30,20 +31,36 @@ pub fn attach(r: anytype, reply: *chat.Reply) Allocator.Error!?[]Value {
     const cut = if (!r.plan.policy.single and std.mem.eql(u8, reply.finish_reason, "length")) try tool_stream.cutCalls(r.a, reply.content, tools) else null;
     if (cut != null) reply.content = try @import("reply_text.zig").cutProse(r.a, reply.content);
     const found = cut orelse parsed.calls;
+    const cut_call: ?*json.Object = if (cut) |list| if (list.len > 0) list[list.len - 1].object else null else null;
     const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse {
         if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
         return null;
     };
-    if (cut != null) return try numbered(r, calls);
+    if (cut != null) {
+        const returned = try numbered(r, calls);
+        try complete(r, reply, returned, cut_call);
+        return returned;
+    }
     reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
     reply.finish_reason = finished(reply.finish_reason);
     if (r.plan.policy.single) reply.tool_calls_streamed = false;
-    return try numbered(r, if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls);
+    const returned = try numbered(r, if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls);
+    try complete(r, reply, returned, null);
+    return returned;
 }
 
 /// Calls in a reply that ended on its own finish tool_calls; any other end (length, deadline, cancel, loop) stays.
 pub fn finished(reason: []const u8) []const u8 {
     return if (std.mem.eql(u8, reason, "stop")) "tool_calls" else reason;
+}
+
+/// A capped reply's complete call indices; object identity preserves the cut position after Cortheon filtering.
+fn complete(r: anytype, reply: *chat.Reply, calls: []Value, cut: ?*json.Object) Allocator.Error!void {
+    if (reply.runtime != .object or !std.mem.eql(u8, reply.finish_reason, "length")) return;
+    const returned_cut = cut != null and calls.len > 0 and calls[calls.len - 1].object == cut.?;
+    const indices = try r.a.alloc(Value, calls.len - @intFromBool(returned_cut));
+    for (indices, 0..) |*slot, i| slot.* = try json.intValue(r.a, i);
+    try reply.runtime.object.put(r.a, "complete_tool_calls", .{ .array = indices });
 }
 
 /// Each call the client gets takes the request's id for its place in the reply (``ids.Calls``).
