@@ -6,6 +6,8 @@ const core = @import("core");
 const cfg = @import("config.zig");
 const affine = @import("affine.zig");
 const widths = @import("widths.zig");
+const tfq3_mod = @import("tfq3.zig");
+const tfq3_dispatch = @import("tfq3_dispatch.zig");
 const wts = @import("gpu_weights.zig");
 const quant = @import("quant_gpu.zig");
 const glue = @import("glue_gpu.zig");
@@ -111,19 +113,29 @@ pub const Model = struct {
         try supported(shard.global);
         var formats = try affine.Formats.init(a, text);
         defer formats.deinit();
-        var ws = try widths.Widths.resolve(a, &formats, shard.local);
-        defer ws.deinit();
         const m = try a.create(Model);
         errdefer a.destroy(m);
         m.allocator = a;
         m.shard = shard;
         m.config = shard.local;
-        m.widths_tag = ws.tag();
         m.device = try mtl.Device.init();
         errdefer m.device.deinit();
         if (!qualifiedGeneration(m.device.generation())) return error.QwenMetalQualificationRequired;
+        var tfq3_store = try tfq3_mod.Store.open(a, io, m.device, dir);
+        errdefer if (tfq3_store) |*s| s.deinit();
+        if (tfq3_store != null and ranks != 1) return error.UnsupportedQuantization;
+        var ws = if (tfq3_store) |*store| blk: {
+            const lookup: widths.Tfq3Lookup = .{ .ctx = store, .bitsFn = storeLookupBits };
+            break :blk try widths.Widths.resolveWithTfq3(a, &formats, shard.local, lookup);
+        } else try widths.Widths.resolve(a, &formats, shard.local);
+        defer ws.deinit();
+        m.widths_tag = ws.tag();
         var why: widths.Why = .{};
-        widths.admit(&ws, shard.local, .{ .tensor_units = m.device.tensorUnits() }, &why) catch |err| {
+        const admit_res = if (tfq3_store != null)
+            widths.admitTfq3(&ws, shard.local, .{ .tensor_units = m.device.tensorUnits() }, &why)
+        else
+            widths.admit(&ws, shard.local, .{ .tensor_units = m.device.tensorUnits() }, &why);
+        admit_res catch |err| {
             std.log.err("qwen27: {s} (layer {?d}) is {d}-bit group {d}; this chip's projection kernels do not run it ({s})", .{ why.module, why.layer, why.width.bits, why.width.group, @errorName(why.reason) });
             return err;
         };
@@ -136,15 +148,23 @@ pub const Model = struct {
         const files = try core.checkpoint_host.shardFiles(a, io, dir);
         defer core.checkpoint_host.freeShardFiles(a, files);
         // projections stay in the files until load repacks them: the weights live once, in their lane layouts
-        for (files) |file| try m.checkpoint.addFileSplit(m.device, file, "", "language_model.", wts.repacked);
+        for (files) |file| {
+            try m.checkpoint.addFileSplit(m.device, file, "", "language_model.", wts.repacked);
+            if (tfq3_store != null) {
+                try m.checkpoint.addFileSplit(m.device, file, "", "model.", wts.repacked);
+                try m.checkpoint.addFileSplit(m.device, file, "", "lm_head.", wts.repacked);
+            }
+        }
         headers.end();
         const packing = timing.span(.read_pack);
-        m.weights = try wts.load(a, m.device, &m.checkpoint, &m.shard, &ws);
+        m.weights = try wts.loadWithTfq3(a, m.device, &m.checkpoint, &m.shard, &ws, if (tfq3_store) |*s| s else null);
+        tfq3_store = null;
         errdefer m.weights.deinit();
         packing.end();
         const pipelines = timing.span(.weight_pipelines);
         m.kernels = .{ .allocator = a, .device = m.device, .raw_tiles = !m.device.tensorUnits(), .long_prompt = quant.longPrompt(std.mem.span(m.device.name()), m.device.tensorUnits()) };
         errdefer m.kernels.deinit();
+        if (m.weights.tfq3 != null) m.kernels.tfq3 = try tfq3_dispatch.Pipes.init(a, m.device);
         m.glue = try glue.Kernels.init(m.device);
         errdefer m.glue.deinit();
         m.moe = if (c.moe()) try moe_gpu.Kernels.init(a, m.device) else null;
@@ -232,6 +252,11 @@ pub const Model = struct {
         m.allocator.destroy(m);
     }
 };
+
+fn storeLookupBits(ctx: *const anyopaque, module: []const u8, n: usize, k: usize) ?u8 {
+    const store: *const tfq3_mod.Store = @ptrCast(@alignCast(ctx));
+    return store.lookupBits(module, n, k);
+}
 
 /// Default frame rows follow attention geometry; a validated environment override keeps its width.
 pub fn promptRows(c: cfg.Config, generation: u32, geometry: @import("attention_plan.zig").Geometry) u32 {

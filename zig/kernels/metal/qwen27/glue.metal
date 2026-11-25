@@ -74,6 +74,15 @@ kernel void q27_embed(device const uint* ids [[buffer(0)]], device const uint* w
   q27_write(out, at.y * a.width + at.x, value, a.metadata);
 }
 
+struct EmbedBf16 { uint width, rows, vocab, pad; };
+
+kernel void q27_embed_bf16(device const uint* ids [[buffer(0)]], device const bfloat* table [[buffer(1)]],
+                           constant EmbedBf16& a [[buffer(2)]], device bfloat* out [[buffer(3)]],
+                           uint2 at [[thread_position_in_grid]]) {
+  if (at.x >= a.width || at.y >= a.rows || ids[at.y] >= a.vocab) return;
+  out[ulong(at.y) * ulong(a.width) + at.x] = table[ulong(ids[at.y]) * ulong(a.width) + at.x];
+}
+
 struct Rope { uint width, heads, rows, rotary, activation; float theta; uint h_end, w_end, plane; };
 
 // Rotate paired halves at each row's position: pair d's axis plane under M-RoPE, plane 0 (t) otherwise.
