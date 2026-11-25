@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Qwen 3.8-27B on Metal: adds native zero-copy TFQ3 (3-, 4- and 5-bit 2D-AffineCoset/half4 with randomized 2D FWHT-128) and pure BF16 residual base support (`qwen27_tfq3*.tffpw` + `pw_v3_tables.bin`, with either unquantized BF16 or MLX affine residuals), fused `gate+up` and `k+v` dispatch, NAX/simdgroup-matrix prefill, and BF16 embedding lookup; non-TFQ3 MLX affine checkpoints stay on existing paths unchanged (#4974).
+
 - Flash Next on CUDA: on one GPU, a prompt chunk before the last skips its last layer's MLP stream and experts, which nothing reads; tokens unchanged, and tensor-parallel passes run as before (#4885).
 
 - Inkling 2 Mini on Metal serves images under `--vision`: PNG, JPEG and WebP decode to 40-pixel patch tokens (resized only past the image budget), the 23-layer vision tower and its projector run on the GPU with the processor's rounding, and the tower's rows replace the image placeholders in a prefill chunk, split across chunks and cache restores like text rows. Without `--vision` images stay refused by name. Each picture the tower runs logs one `inkling2 image tower:` line with the picture's content hash, its rows and the SHA-256 of the BF16 rows it hands to the splice. The tower is checked against an FP64 reference on the original checkpoint, and its kernels carry contract records and planted controls (#4704, refs #4274 and #4387). Thanks to @BlivionIaG.
