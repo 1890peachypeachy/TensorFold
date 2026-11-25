@@ -4,7 +4,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
-- CLI: `tensorfold tfq3 MODEL` resolves a local checkpoint or pulls an uncached Hugging Face repo id, detects the model family (`qwen3_5`, `qwen4_exp`, `glm5_next`, or model-agnostic `generic`), supports `--bits`, `--target-gib`, `--fit auto|GB`, `--quantize-vision`/`--quantize-drafter`/`--quantize-embed`, and `--native` (a built-in zero-install pure-Zig TFQ3 encoder when the GPU `tfq3` binary is absent), and validates checkpoints via `tensorfold tfq3 inspect` (#5018).
+- CLI: `tensorfold tfq3 MODEL` resolves a local checkpoint or pulls an uncached Hugging Face repo id, detects known TFQ3 families (`qwen3_5`, `qwen4_exp`, `glm5_next`) or routes any other Safetensors architecture to the model-agnostic path (`--bits`, `--target-gib`, `--fit auto|GB`, `--quantize-vision`, `--quantize-drafter`, `--quantize-embed`), dispatches to `tfq3` when installed, and includes a built-in zero-install pure-Zig TFQ3 encoder (`--native` / automatic fallback) and shard validator (`tensorfold tfq3 inspect`) (#5018).
 
 - Tokenizer: split patterns may use `\A`, `\z`, `$`, `\G` and atomic groups `(?>...)` as Oniguruma reads them, so ERNIE 5.5's `tokenizer.json`, which groups digits in threes from the right with them, loads instead of failing with `UnsupportedRegex`; patterns that loaded before split as they did (#4984).
 
