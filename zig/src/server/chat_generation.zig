@@ -162,13 +162,14 @@ pub const Generation = struct {
         if (g.srv.text.vtable.format == .kimi) return @import("chat_kimi.zig").stream(g, sink);
         if (@import("chat_inkling2.zig").enabled(g.srv)) return @import("chat_inkling2.zig").stream(g, sink);
         const raw_visible = g.stops.visible(all, true);
-        const text = try @import("tool_minimax.zig").dsml(g.a, raw_visible, g.tools); // MiniMax-M3's calls as DSML
+        const text = try @import("tool_ernie.zig").dsml(g.a, try @import("tool_minimax.zig").dsml(g.a, raw_visible, g.tools), g.tools);
         var answer = text;
         var thought: []const u8 = "";
         if (g.thinking or g.recipient != null) {
             const split = if (g.recipient) |*r| try r.split(g.a, text, .streaming) else blk: {
                 const original_close = try g.visible.closeOf(g.a, reply_text.decodeText, g.srv.text, g.srv.close_id);
-                const close = try @import("tool_minimax.zig").closeAfterRewrite(g.a, raw_visible, g.tools, original_close);
+                const close_mm = try @import("tool_minimax.zig").closeAfterRewrite(g.a, raw_visible, g.tools, original_close);
+                const close = try @import("tool_ernie.zig").closeAfterRewrite(g.a, raw_visible, g.tools, close_mm);
                 break :blk try reply_text.splitThinkingAt(g.a, text, false, g.srv.markers, close);
             };
             thought = g.streamed_reasoning.after(reply_text.pyStrip(split.reasoning), true); // the whole reply strips it
@@ -322,9 +323,9 @@ pub const Generation = struct {
         const inkling = @import("chat_inkling2.zig").enabled(g.srv);
         const native: ?@import("native_reply.zig").Result = if (g.srv.text.vtable.format == .kimi) try @import("chat_kimi.zig").read(g, content_tokens, true) else if (inkling) try @import("chat_inkling2.zig").read(g, content_tokens, true) else null;
         const raw_visible = g.stops.visible(raw, false);
-        const visible = if (native) |n| n.content else try @import("tool_minimax.zig").dsml(a, raw_visible, g.tools);
+        const visible = if (native) |n| n.content else try @import("tool_ernie.zig").dsml(a, try @import("tool_minimax.zig").dsml(a, raw_visible, g.tools), g.tools);
         const close_at: ?reply_text.Close = if (native == null and g.thinking)
-            try @import("tool_minimax.zig").closeAfterRewrite(a, raw_visible, g.tools, try reply_text.closeWhere(a, reply_text.decodeText, g.srv.text, content_tokens, g.srv.close_id))
+            try @import("tool_ernie.zig").closeAfterRewrite(a, raw_visible, g.tools, try @import("tool_minimax.zig").closeAfterRewrite(a, raw_visible, g.tools, try reply_text.closeWhere(a, reply_text.decodeText, g.srv.text, content_tokens, g.srv.close_id)))
         else
             null;
         const call_tail = answerTail(visible, g.srv.markers, close_at);

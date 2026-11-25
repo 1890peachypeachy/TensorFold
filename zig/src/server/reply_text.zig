@@ -9,11 +9,14 @@ pub const Markers = struct { open: []const u8, close: []const u8, optional: bool
 pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
 /// MiniMax-M3's adaptive thinking: the reply writes `<mm:think>...</mm:think>` itself, or `</mm:think>` alone.
 pub const mm_markers: Markers = .{ .open = "", .close = "</mm:think>" };
+pub const ernie_markers: Markers = .{ .open = "", .close = "</ernie:think>" };
 /// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's and MiniMax-M3's do).
 const think_open = "<think>";
 
 fn openerOf(m: Markers) []const u8 {
-    return if (std.mem.eql(u8, m.close, mm_markers.close)) "<mm:think>" else think_open;
+    if (std.mem.eql(u8, m.close, mm_markers.close)) return "<mm:think>";
+    if (std.mem.eql(u8, m.close, ernie_markers.close)) return "<ernie:think>";
+    return think_open;
 }
 pub const channel_markers: Markers = .{ .open = "<|channel>thought", .close = "<channel|>" };
 /// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, LFM2's, V4.1's spaced DSML.
@@ -35,10 +38,15 @@ pub const shared_openers: Openers = .{ .calls = &calls, .leads = &leads };
 const mm_calls = calls ++ [_][2][]const u8{.{ "]<]minimax[>[<tool_call>", "]<]minimax[>[</tool_call>" }};
 const mm_leads = leads ++ [_][]const []const u8{&.{}};
 const mm_openers: Openers = .{ .calls = &mm_calls, .leads = &mm_leads };
+const ernie_calls = calls ++ [_][2][]const u8{.{ "<ernie:tool_call>", "</ernie:tool_call>" }};
+const ernie_leads = leads ++ [_][]const []const u8{&.{}};
+const ernie_openers: Openers = .{ .calls = &ernie_calls, .leads = &ernie_leads };
 
 /// The openers for a server's markers: MiniMax-M3's block only where the markers are MiniMax-M3's.
 pub fn openersOf(m: Markers) Openers {
-    return if (std.mem.eql(u8, m.close, mm_markers.close)) mm_openers else shared_openers;
+    if (std.mem.eql(u8, m.close, mm_markers.close)) return mm_openers;
+    if (std.mem.eql(u8, m.close, ernie_markers.close)) return ernie_openers;
+    return shared_openers;
 }
 
 /// Whether the text after an opener is a call's payload, may still become one, or is prose that names the opener.

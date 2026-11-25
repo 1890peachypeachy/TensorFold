@@ -211,3 +211,8 @@ pub const train_attn: []const u8 = if (available) &Blob("fatbin_train_attn").byt
 pub const flashnext_train: []const u8 = if (available) &Blob("fatbin_flashnext_train").bytes else &.{};
 pub const attn_train: []const u8 = if (available) &Blob("fatbin_attn_train").bytes else &.{};
 pub const qwen27_train: []const u8 = if (available) &Blob("fatbin_qwen27_train").bytes else &.{};
+
+pub const ernie55_ops: []const u8 = if (available) &Blob("fatbin_ernie55_ops").bytes else &.{};
+pub const ernie55_mxfp4: []const u8 = if (available) &Blob("fatbin_ernie55_mxfp4").bytes else &.{};
+pub const ernie55_hca: []const u8 = if (available) &Blob("fatbin_ernie55_hca").bytes else &.{};
+pub const ernie55_dsa: []const u8 = if (available) &Blob("fatbin_ernie55_dsa").bytes else &.{};

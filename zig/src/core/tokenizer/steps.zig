@@ -59,11 +59,24 @@ fn char(s: []const u8) Error!u21 {
 pub const Pattern = union(enum) {
     literal: []const u8,
     regex: regex.Regex,
+    ernie_digits_510,
+    ernie_digits_lead12,
+    ernie_digits_3,
+
+    fn isNd(cp: u21) bool {
+        const mask = comptime unicode.propertyMask("Nd").?;
+        return (unicode.bit(unicode.category(cp)) & mask) != 0;
+    }
 
     fn parse(a: Allocator, v: ?Value) Error!Pattern {
         const p = v orelse return error.InvalidTokenizer;
         if (string(p, "String")) |s| return .{ .literal = s };
-        if (string(p, "Regex")) |s| return .{ .regex = try regex.Regex.compile(a, s) };
+        if (string(p, "Regex")) |s| {
+            if (std.mem.eql(u8, s, "\\p{Nd}{1,510}(?=(?>\\p{Nd}{510})*(?:\\P{Nd}|$))|\\G\\p{Nd}{510}")) return .ernie_digits_510;
+            if (std.mem.eql(u8, s, "\\A\\p{Nd}{1,2}(?=\\p{Nd}{3}+\\z)")) return .ernie_digits_lead12;
+            if (std.mem.eql(u8, s, "\\A\\p{Nd}{3}|\\G\\p{Nd}{3}")) return .ernie_digits_3;
+            return .{ .regex = try regex.Regex.compile(a, s) };
+        }
         return error.InvalidTokenizer;
     }
 
@@ -84,6 +97,73 @@ pub const Pattern = union(enum) {
                 }
             },
             .regex => |*re| try re.findAll(&ctx.matcher, s, &ctx.hits),
+            .ernie_digits_510 => {
+                var i: usize = 0;
+                while (i < s.len) {
+                    const d0 = unicode.decodeAt(s, i);
+                    if (!isNd(d0.cp)) {
+                        i += d0.len;
+                        continue;
+                    }
+                    const run_start = i;
+                    var nd_n: usize = 0;
+                    while (i < s.len) {
+                        const d = unicode.decodeAt(s, i);
+                        if (!isNd(d.cp)) break;
+                        nd_n += 1;
+                        i += d.len;
+                    }
+                    var rem = nd_n % 510;
+                    if (rem == 0) rem = 510;
+                    var p0 = run_start;
+                    var left = nd_n;
+                    while (left > 0) {
+                        const take = if (p0 == run_start) rem else @min(left, 510);
+                        var p1 = p0;
+                        for (0..take) |_| p1 += unicode.decodeAt(s, p1).len;
+                        try ctx.hits.append(ctx.a, .{ p0, p1 });
+                        p0 = p1;
+                        left -= take;
+                    }
+                }
+            },
+            .ernie_digits_lead12 => {
+                var i: usize = 0;
+                var nd_n: usize = 0;
+                var all_nd = true;
+                while (i < s.len) {
+                    const d = unicode.decodeAt(s, i);
+                    if (!isNd(d.cp)) {
+                        all_nd = false;
+                        break;
+                    }
+                    nd_n += 1;
+                    i += d.len;
+                }
+                if (all_nd and nd_n >= 4 and (nd_n % 3) != 0) {
+                    const take = nd_n % 3;
+                    var p1: usize = 0;
+                    for (0..take) |_| p1 += unicode.decodeAt(s, p1).len;
+                    try ctx.hits.append(ctx.a, .{ 0, p1 });
+                }
+            },
+            .ernie_digits_3 => {
+                var i: usize = 0;
+                while (i < s.len) {
+                    const start = i;
+                    var got: usize = 0;
+                    var j = i;
+                    while (j < s.len and got < 3) {
+                        const d = unicode.decodeAt(s, j);
+                        if (!isNd(d.cp)) break;
+                        got += 1;
+                        j += d.len;
+                    }
+                    if (got < 3) break;
+                    try ctx.hits.append(ctx.a, .{ start, j });
+                    i = j;
+                }
+            },
         }
         var prev: usize = 0;
         for (ctx.hits.items) |hit| {

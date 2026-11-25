@@ -36,6 +36,7 @@ pub const HfText = struct {
     native_kimi: ?*KimiText = null,
     source: []const u8 = "",
     native_deepseek: bool = false,
+    native_ernie: bool = false,
     native_inkling2: bool = false,
     schema_prompt: bool = true, // TF_DSV41_SCHEMA_PROMPT: response_format's schema as the encoder's ``## Response Format``
     overridden: bool = false, // the chat template is --chat-template's file
@@ -106,6 +107,7 @@ pub const HfText = struct {
                 (std.mem.eql(u8, kind.string, "inkling2") or std.mem.eql(u8, kind.string, "inkling2_loop"));
             t.native_deepseek = template_override == null and kind == .string and
                 (std.mem.eql(u8, kind.string, "deepseek_v4") or std.mem.eql(u8, kind.string, "deepseek_v41"));
+            t.native_ernie = template_override == null and kind == .string and std.mem.eql(u8, kind.string, "ernie5_5_moe");
             if (kind == .string and std.mem.eql(u8, kind.string, "glm5_next")) {
                 const value = if (std.c.getenv(clear_thinking_env)) |v| std.mem.span(v) else null;
                 t.clear_thinking = glmClearThinking(value) orelse {
@@ -348,6 +350,7 @@ pub const HfText = struct {
 
     fn sourceFn(ctx: *anyopaque) []const u8 {
         const t = self(ctx);
+        if (t.native_ernie and t.compiled == null) return "enable_thinking thinking_mode reasoning_effort [\"low\", \"medium\", \"high\"] <|ernie:im_start|><|ernie:im_end|><ernie:think></ernie:think><ernie:tool_call></ernie:tool_call>";
         const source = if (t.native_deepseek and t.compiled == null) "enable_thinking thinking_mode reasoning_effort [\"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\", \"max\"] " ++ dsv41.BOS ++ dsv41.USER ++ dsv41.ASSISTANT ++ dsv41.CALLS_OPEN else t.source;
         return if (t.tool_source.len > 0) std.mem.concat(t.arena.allocator(), u8, &.{ source, " ", t.tool_source }) catch source else source;
     }
@@ -397,6 +400,7 @@ pub const HfText = struct {
         const t = self(ctx);
         const compiled = if (options.tools != null and t.tool_compiled != null) &t.tool_compiled.? else if (t.compiled) |*c| c else {
             if (t.native_deepseek) return t.renderDeepseek(a, messages, options, problem);
+            if (t.native_ernie) return @import("ernie_chat.zig").render(a, messages, options, problem);
             problem.* = "this checkpoint has no chat template: send a completion prompt instead";
             return error.Template;
         };

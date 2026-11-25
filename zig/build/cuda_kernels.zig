@@ -198,6 +198,10 @@ pub const kernels = [_]Kernel{
     .{ .name = "drama3", .flags = &.{"-O3"} },
     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },
     .{ .name = "drama3_codec", .flags = &.{"-O3"} },
+    .{ .name = "ernie55_ops", .src = "ernie55/ops", .flags = glue },
+    .{ .name = "ernie55_mxfp4", .src = "ernie55/mxfp4_situ", .flags = &.{"-O3"} },
+    .{ .name = "ernie55_hca", .src = "ernie55/hca_attn", .flags = &.{"-O3"} },
+    .{ .name = "ernie55_dsa", .src = "ernie55/dsa_attn", .flags = &.{"-O3"} },
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

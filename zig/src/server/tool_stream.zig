@@ -9,6 +9,7 @@ const tool_dsml_stream = @import("tool_dsml_stream.zig");
 const tool_glm_cut = @import("tool_glm_cut.zig");
 const tool_json_cut = @import("tool_json_cut.zig");
 const tool_minimax = @import("tool_minimax.zig");
+const tool_ernie = @import("tool_ernie.zig");
 const tool_json_close = @import("tool_json_close.zig");
 const tool_glm_stream = @import("tool_glm_stream.zig");
 const tool_params = @import("tool_params.zig");
@@ -55,7 +56,7 @@ pub const Streamer = struct {
     typed: bool = false,
     buffer: std.ArrayList(u8) = .empty,
     pos: usize = 0,
-    state: enum { outside, call, buffered, function, value, closing, glm, dsml, minimax, abort } = .outside,
+    state: enum { outside, call, buffered, function, value, closing, glm, dsml, minimax, ernie, abort } = .outside,
     index: i64 = -1,
     args_open: bool = false,
     lead: bool = false,
@@ -191,6 +192,16 @@ pub const Streamer = struct {
                             s.searched = start;
                             return;
                         }
+                        if (std.mem.startsWith(u8, text[start..], tool_ernie.open)) {
+                            s.buffered_start = start;
+                            s.pos = start + tool_ernie.open.len;
+                            s.state = .ernie;
+                            break;
+                        }
+                        if (text[start..].len < tool_ernie.open.len and std.mem.startsWith(u8, tool_ernie.open, text[start..])) {
+                            s.searched = start;
+                            return;
+                        }
                         if (std.mem.startsWith(u8, text[start..], "<tool_call>")) {
                             s.buffered_start = start;
                             s.pos = start + "<tool_call>".len;
@@ -296,6 +307,22 @@ pub const Streamer = struct {
                     s.searched = s.pos;
                     s.state = .outside;
                     const converted = try tool_minimax.dsml(s.a, text[s.buffered_start..s.pos], s.tools);
+                    const parsed = try tool_parse.parse(s.a, converted, s.tools, null);
+                    if (parsed.calls) |calls| try s.emitCalls(calls, out);
+                },
+                .ernie => {
+                    if (s.buffered_start > text.len or !std.mem.startsWith(u8, text[s.buffered_start..], tool_ernie.open)) {
+                        s.pos = @min(s.buffered_start, text.len);
+                        s.searched = s.pos;
+                        s.code.jumpTo(s.pos);
+                        s.state = .outside;
+                        continue;
+                    }
+                    const end = std.mem.indexOfPos(u8, text, s.buffered_start + tool_ernie.open.len, tool_ernie.close) orelse return;
+                    s.pos = end + tool_ernie.close.len;
+                    s.searched = s.pos;
+                    s.state = .outside;
+                    const converted = try tool_ernie.dsml(s.a, text[s.buffered_start..s.pos], s.tools);
                     const parsed = try tool_parse.parse(s.a, converted, s.tools, null);
                     if (parsed.calls) |calls| try s.emitCalls(calls, out);
                 },

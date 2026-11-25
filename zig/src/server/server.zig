@@ -152,7 +152,8 @@ pub const Server = struct {
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         const minimax = text.tokenId(reply_text.mm_markers.close) != null;
-        if (minimax) srv.markers = reply_text.mm_markers else if (srv.info.reasoning_optional and std.mem.eql(u8, srv.markers.close, reply_text.think_markers.close)) srv.markers.optional = true;
+        const ernie = text.tokenId(reply_text.ernie_markers.close) != null;
+        if (minimax) srv.markers = reply_text.mm_markers else if (ernie) srv.markers = reply_text.ernie_markers else if (srv.info.reasoning_optional and std.mem.eql(u8, srv.markers.close, reply_text.think_markers.close)) srv.markers.optional = true;
         srv.close_id = text.tokenId(srv.markers.close);
         srv.recipients = recipient_reply.detect(text);
         const source = text.templateSource();
@@ -161,7 +162,7 @@ pub const Server = struct {
         // Inkling 2's template has no enable_thinking: its off is reasoning_effort "none" (effort level 0)
         if (@import("chat_inkling2.zig").enabled(srv)) srv.off_effort = "none";
         // MiniMax-M3's template decides on its own; thinking off closes the block in the prompt (prompt.zig)
-        srv.thinking_switch = minimax or std.mem.indexOf(u8, source, "enable_thinking") != null or
+        srv.thinking_switch = minimax or ernie or std.mem.indexOf(u8, source, "enable_thinking") != null or
             std.mem.indexOf(u8, source, "thinking_mode") != null;
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(source);
@@ -169,7 +170,7 @@ pub const Server = struct {
             const template_images = templateImages(srv);
             if (!template_images) log.line("warning: --vision: the chat template writes no image placeholder for an image part, so image requests will fail; serve with --chat-template naming a template that has an image path", .{});
         }
-        if (text.tokenId(if (minimax) reply_text.mm_markers.close else "</think>")) |end| {
+        if (text.tokenId(if (minimax) reply_text.mm_markers.close else if (ernie) reply_text.ernie_markers.close else "</think>")) |end| {
             const lead = try text.encode(a, "\n", false);
             const trail = try text.encode(a, "\n\n", false);
             srv.think_close = try std.mem.concat(a, u32, &.{ lead, &.{end}, trail });
