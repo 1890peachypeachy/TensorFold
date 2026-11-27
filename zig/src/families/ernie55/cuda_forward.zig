@@ -43,6 +43,9 @@ pub const Runner = struct {
     lane: *const Lane,
     w: *const Weights,
     group: ?*const Group = null,
+    comm_stream: ?Stream = null,
+    ev_shared: ?cuda.Event = null,
+    ev_comm: ?cuda.Event = null,
 
     pub fn allReduceBf16(self: *const Runner, s: Stream, buf: u64, gather_buf: u64, count: usize) !void {
         const g = self.group orelse return;
@@ -643,23 +646,40 @@ pub const Runner = struct {
         try self.fp8(s, sc.layer_in, c.hidden, rows, moe.fc1_shared_w13, sc.proj_tmp, sc.qmmf_part);
         try k.moeSplitSitu(s, sc.proj_tmp, sc.latent_in, sc.dense_gate, rows, c.moe_latent, sh.moe_width, c.situ_beta, c.situ_linear_beta);
 
-        // Routed MXFP4 experts (TP partial [rows, 2048])
-        if (rows >= grouped_min_rows) {
+        const overlap_shared = rows >= 256 and self.group != null and self.group.?.world > 1 and
+            self.comm_stream != null and self.ev_shared != null and self.ev_comm != null;
+        if (overlap_shared) {
+            const cs = self.comm_stream.?;
+            // Shared expert down projection first -> overlap its ncclAllReduce on comm_stream with moeGrouped on s!
+            try self.fp8(s, sc.dense_gate, sh.moe_width, rows, moe.shared_w2, sc.shared_out, sc.qmmf_part);
+            try self.ev_shared.?.record(s);
+            try cs.wait(self.ev_shared.?);
+            try self.allReduceBf16(cs, sc.shared_out, sc.tp_gather, rows * c.hidden);
+            try self.ev_comm.?.record(cs);
+
             try k.moeGrouped(s, sc.latent_in, moe.w1_q, moe.w1_s, moe.w3_q, moe.w3_s, moe.w2_q, moe.w2_s, sc.topk_ids, sc.topk_w, sc.route_counts, sc.route_offsets, sc.route_cursor, sc.route_list, sc.moe_mid, sc.moe_part, sc.routed_out, rows, c.topk, c.experts, sh.moe_width, c.moe_latent, c.moe_latent, sh.moe_width, c.situ_beta, c.situ_linear_beta);
+
+            try s.wait(self.ev_comm.?);
+            try self.allReduceBf16(s, sc.routed_out, sc.tp_gather, rows * c.moe_latent);
         } else {
-            try k.mxfp4W13Situ(s, sc.latent_in, moe.w1_q, moe.w1_s, moe.w3_q, moe.w3_s, sc.topk_ids, sc.moe_mid, rows, c.topk, sh.moe_width, c.moe_latent, c.situ_beta, c.situ_linear_beta);
-            try k.mxfp4W2Combine(s, sc.moe_mid, moe.w2_q, moe.w2_s, sc.topk_ids, sc.topk_w, sc.routed_out, rows, c.topk, c.moe_latent, sh.moe_width);
-        }
+            // Routed MXFP4 experts (TP partial [rows, 2048])
+            if (rows >= grouped_min_rows) {
+                try k.moeGrouped(s, sc.latent_in, moe.w1_q, moe.w1_s, moe.w3_q, moe.w3_s, moe.w2_q, moe.w2_s, sc.topk_ids, sc.topk_w, sc.route_counts, sc.route_offsets, sc.route_cursor, sc.route_list, sc.moe_mid, sc.moe_part, sc.routed_out, rows, c.topk, c.experts, sh.moe_width, c.moe_latent, c.moe_latent, sh.moe_width, c.situ_beta, c.situ_linear_beta);
+            } else {
+                try k.mxfp4W13Situ(s, sc.latent_in, moe.w1_q, moe.w1_s, moe.w3_q, moe.w3_s, sc.topk_ids, sc.moe_mid, rows, c.topk, sh.moe_width, c.moe_latent, c.situ_beta, c.situ_linear_beta);
+                try k.mxfp4W2Combine(s, sc.moe_mid, moe.w2_q, moe.w2_s, sc.topk_ids, sc.topk_w, sc.routed_out, rows, c.topk, c.moe_latent, sh.moe_width);
+            }
 
-        // Shared expert down projection (TP partial [rows, 4096])
-        try self.fp8(s, sc.dense_gate, sh.moe_width, rows, moe.shared_w2, sc.shared_out, sc.qmmf_part);
+            // Shared expert down projection (TP partial [rows, 4096])
+            try self.fp8(s, sc.dense_gate, sh.moe_width, rows, moe.shared_w2, sc.shared_out, sc.qmmf_part);
 
-        // 4. Single packed AllReduce for BOTH [routed_out (2048), shared_out (4096)] = 6144 elements!
-        if (self.group) |g| {
-            if (g.world > 1) {
-                try k.packPairBf16(s, sc.routed_out, sc.shared_out, sc.moe_pack, rows, c.moe_latent, c.hidden);
-                try self.allReduceBf16(s, sc.moe_pack, sc.tp_gather, rows * (c.moe_latent + c.hidden));
-                try k.unpackPairBf16(s, sc.moe_pack, sc.routed_out, sc.shared_out, rows, c.moe_latent, c.hidden);
+            // 4. Single packed AllReduce for BOTH [routed_out (2048), shared_out (4096)] = 6144 elements!
+            if (self.group) |g| {
+                if (g.world > 1) {
+                    try k.packPairBf16(s, sc.routed_out, sc.shared_out, sc.moe_pack, rows, c.moe_latent, c.hidden);
+                    try self.allReduceBf16(s, sc.moe_pack, sc.tp_gather, rows * (c.moe_latent + c.hidden));
+                    try k.unpackPairBf16(s, sc.moe_pack, sc.routed_out, sc.shared_out, rows, c.moe_latent, c.hidden);
+                }
             }
         }
 

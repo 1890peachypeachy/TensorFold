@@ -65,6 +65,12 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     var stream = try cuda.Stream.init(&driver, false);
     defer stream.deinit();
+    var comm_stream = try cuda.Stream.init(&driver, true);
+    defer comm_stream.deinit();
+    var ev_shared = try cuda.Event.init(&driver, false);
+    defer ev_shared.deinit();
+    var ev_comm = try cuda.Event.init(&driver, false);
+    defer ev_comm.deinit();
 
     var group_opt: ?cuda.tp_group.Group = null;
     if (tp > 1) {
@@ -112,6 +118,9 @@ pub fn main(init: std.process.Init) !u8 {
         .lane = &lane,
         .w = &w,
         .group = if (group_opt) |*g| g else null,
+        .comm_stream = comm_stream,
+        .ev_shared = ev_shared,
+        .ev_comm = ev_comm,
     };
 
     var dspark_caches: ?ernie.cuda_dspark.Caches = null;

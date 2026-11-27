@@ -124,6 +124,9 @@ pub const Engine = struct {
     io: std.Io,
     d: *const cuda.Driver,
     stream: cuda.Stream,
+    comm_stream: cuda.Stream,
+    ev_shared: cuda.Event,
+    ev_comm: cuda.Event,
     lane: cuda.qmmf.Lane,
     k: kernels.Kernels,
     w: weights.Weights,
@@ -149,6 +152,12 @@ pub const Engine = struct {
 
         var stream = try cuda.Stream.init(d, false);
         errdefer stream.deinit();
+        var comm_stream = try cuda.Stream.init(d, true);
+        errdefer comm_stream.deinit();
+        var ev_shared = try cuda.Event.init(d, false);
+        errdefer ev_shared.deinit();
+        var ev_comm = try cuda.Event.init(d, false);
+        errdefer ev_comm.deinit();
 
         var lane = try cuda.qmmf.Lane.load(d, 12);
         errdefer lane.unload();
@@ -174,6 +183,9 @@ pub const Engine = struct {
             .io = io,
             .d = d,
             .stream = stream,
+            .comm_stream = comm_stream,
+            .ev_shared = ev_shared,
+            .ev_comm = ev_comm,
             .lane = lane,
             .k = k,
             .w = w,
@@ -206,12 +218,23 @@ pub const Engine = struct {
         e.w.deinit();
         e.k.unload();
         e.lane.unload();
+        e.ev_comm.deinit();
+        e.ev_shared.deinit();
+        e.comm_stream.deinit();
         e.stream.deinit();
         e.gpa.destroy(e);
     }
 
     pub fn runner(e: *const Engine) fw.Runner {
-        return .{ .k = &e.k, .lane = &e.lane, .w = &e.w, .group = e.group };
+        return .{
+            .k = &e.k,
+            .lane = &e.lane,
+            .w = &e.w,
+            .group = e.group,
+            .comm_stream = e.comm_stream,
+            .ev_shared = e.ev_shared,
+            .ev_comm = e.ev_comm,
+        };
     }
 
     pub fn streamBytes(e: *const Engine) usize {
