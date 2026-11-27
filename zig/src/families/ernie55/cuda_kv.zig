@@ -287,6 +287,8 @@ pub const Scratch = struct {
         const o_attn_split_l = reserve(&off, split_rows * 12 * 16 * 4);
 
         s.buf = try DeviceBuffer.alloc(d, off);
+        errdefer s.buf.free();
+        try s.buf.fill8(0, null);
         const b = s.buf.ptr;
 
         s.ids = b + o_ids;

@@ -69,6 +69,24 @@ pub const Runner = struct {
         try self.k.rankSumF32(s, gather_buf, buf, count, g.world);
     }
 
+    pub fn reduceScatterBf16(self: *const Runner, s: Stream, send_buf: u64, recv_buf: u64, recv_count: usize) !void {
+        const g = self.group orelse return;
+        if (g.world <= 1) return;
+        try g.lib.check(g.lib.api.ncclReduceScatter(send_buf, recv_buf, recv_count, .bf16, .sum, g.comm, s.handle), "ncclReduceScatter");
+    }
+
+    pub fn allGatherBf16(self: *const Runner, s: Stream, send_buf: u64, recv_buf: u64, send_count: usize) !void {
+        const g = self.group orelse return;
+        if (g.world <= 1) return;
+        try g.lib.check(g.lib.api.ncclAllGather(send_buf, recv_buf, send_count, .bf16, g.comm, s.handle), "ncclAllGather");
+    }
+
+    pub fn broadcastBf16(self: *const Runner, s: Stream, buf: u64, count: usize, root: usize) !void {
+        const g = self.group orelse return;
+        if (g.world <= 1) return;
+        try g.lib.check(g.lib.api.ncclBroadcast(buf, buf, count, .bf16, @intCast(root), g.comm, s.handle), "ncclBroadcast");
+    }
+
     pub fn fp8(self: *const Runner, s: Stream, x: u64, ldx: usize, rows: usize, w: cuda.qmmf.Weight, y: u64, part: u64) !void {
         if (rows >= 32 and w.mode == .bf16 and ldx == w.k and w.k % 32 == 0) {
             if (self.w.bf16_raw.get(w.codes)) |raw_w| {
@@ -232,8 +250,16 @@ pub const Runner = struct {
         const sh = &self.w.share;
         const k = self.k;
 
-        // 1. Embed lookup + broadcast to 4-stream mHC residual
-        try k.embedBroadcast(s, sc.ids, self.w.embed, sc.res_a, rows, c.hidden, c.hc_mult);
+        // Sequence-parallel row-sharded prefill: each rank owns hc_rows = rows / world of mHC residual & norms.
+        const sp_prefill = (tab == null and segs.len == 1 and self.group != null and self.group.?.world > 1 and
+            rows >= 256 and rows % self.group.?.world == 0);
+        const sp_world: usize = if (sp_prefill) self.group.?.world else 1;
+        const sp_rank: usize = if (sp_prefill) self.group.?.rank else 0;
+        const hc_rows: usize = if (sp_prefill) rows / sp_world else rows;
+        const hc_r0: usize = if (sp_prefill) sp_rank * hc_rows else 0;
+
+        // 1. Embed lookup + broadcast to 4-stream mHC residual (only hc_rows on this rank when sp_prefill)
+        try k.embedBroadcast(s, sc.ids + hc_r0 * 4, self.w.embed, sc.res_a, hc_rows, c.hidden, c.hc_mult);
 
         var res_cur = sc.res_a;
         var res_nxt = sc.res_b;
@@ -241,6 +267,7 @@ pub const Runner = struct {
         // 2. Decoder layers
         for (self.w.layers, 0..) |*ly, li| {
             // --- 2a. Attention mHC pre (collapse + attn_norm) ---
+            const attn_pre_dst: u64 = if (sp_prefill) sc.sub_out else sc.layer_in;
             try k.mhcPreFast(
                 s,
                 res_cur,
@@ -252,8 +279,8 @@ pub const Runner = struct {
                 ly.attn_norm,
                 sc.post_mix,
                 sc.comb_mix,
-                sc.layer_in,
-                rows,
+                attn_pre_dst,
+                hc_rows,
                 c.hidden,
                 c.eps,
                 c.hc_eps,
@@ -261,18 +288,22 @@ pub const Runner = struct {
                 c.hc_sinkhorn_iters,
                 c.eps,
             );
+            if (sp_prefill) {
+                try self.allGatherBf16(s, sc.sub_out, sc.layer_in, hc_rows * c.hidden);
+            }
 
-            // --- 2b. Attention (HCA or MLA-DSA) -> sc.sub_out [rows, 4096] ---
+            // --- 2b. Attention (HCA or MLA-DSA) -> sc.sub_out [rows, 4096] (or sc.layer_in [hc_rows, 4096] when sp_prefill) ---
             switch (ly.attn) {
-                .hca => |*hca| if (tab != null) try self.forwardHcaTab(s, hca, li, sc, rows) else try self.forwardHca(s, hca, segs, li, sc, rows),
-                .dsa => |*dsa| if (tab) |tm| try self.forwardDsaTab(s, dsa, tm, li, sc, rows) else try self.forwardDsa(s, dsa, segs, li, sc, rows),
+                .hca => |*hca| if (tab != null) try self.forwardHcaTab(s, hca, li, sc, rows) else try self.forwardHca(s, hca, segs, li, sc, rows, sp_prefill),
+                .dsa => |*dsa| if (tab) |tm| try self.forwardDsaTab(s, dsa, tm, li, sc, rows) else try self.forwardDsa(s, dsa, segs, li, sc, rows, sp_prefill),
             }
 
             // --- 2c. Attention mHC post ---
-            try k.mhcPost(s, sc.sub_out, res_cur, sc.post_mix, sc.comb_mix, res_nxt, 0, rows, c.hidden);
+            try k.mhcPost(s, if (sp_prefill) sc.layer_in else sc.sub_out, res_cur, sc.post_mix, sc.comb_mix, res_nxt, 0, hc_rows, c.hidden);
             std.mem.swap(u64, &res_cur, &res_nxt);
 
             // --- 2d. FFN mHC pre (collapse + ffn_norm) ---
+            const ffn_pre_dst: u64 = if (sp_prefill) sc.sub_out else sc.layer_in;
             try k.mhcPreFast(
                 s,
                 res_cur,
@@ -284,8 +315,8 @@ pub const Runner = struct {
                 ly.ffn_norm,
                 sc.post_mix,
                 sc.comb_mix,
-                sc.layer_in,
-                rows,
+                ffn_pre_dst,
+                hc_rows,
                 c.hidden,
                 c.eps,
                 c.hc_eps,
@@ -293,19 +324,28 @@ pub const Runner = struct {
                 c.hc_sinkhorn_iters,
                 c.eps,
             );
+            if (sp_prefill) {
+                try self.allGatherBf16(s, sc.sub_out, sc.layer_in, hc_rows * c.hidden);
+            }
 
-            // --- 2e. FFN (Dense SITU MLP or Latent MXFP4 SITU MoE + Shared) -> sc.sub_out ---
+            // --- 2e. FFN (Dense SITU MLP or Latent MXFP4 SITU MoE + Shared) -> sc.sub_out (or sc.layer_in [hc_rows, 4096] when sp_prefill) ---
             switch (ly.ffn) {
-                .dense => |*mlp| try self.forwardDenseMlp(s, mlp, sc, rows),
-                .moe => |*moe| try self.forwardMoe(s, moe, sc, rows),
+                .dense => |*mlp| try self.forwardDenseMlp(s, mlp, sc, rows, sp_prefill),
+                .moe => |*moe| try self.forwardMoeSp(s, moe, sc, rows, sp_prefill),
             }
 
             // --- 2f. FFN mHC post (with optional DSpark aux_mean tap at layers 39, 40, 41) ---
-            const tap_ptr: u64 = if (taps_out != 0 and li >= 39 and li <= 41)
+            const sp_tap_gather = sp_prefill and taps_out != 0 and li >= 39 and li <= 41;
+            const tap_ptr: u64 = if (sp_tap_gather)
+                sc.sub_out
+            else if (taps_out != 0 and li >= 39 and li <= 41)
                 sc.dspark_taps_tmp + (li - 39) * rows * c.hidden * 2
             else
                 0;
-            try k.mhcPost(s, sc.sub_out, res_cur, sc.post_mix, sc.comb_mix, res_nxt, tap_ptr, rows, c.hidden);
+            try k.mhcPost(s, if (sp_prefill) sc.layer_in else sc.sub_out, res_cur, sc.post_mix, sc.comb_mix, res_nxt, tap_ptr, hc_rows, c.hidden);
+            if (sp_tap_gather) {
+                try self.allGatherBf16(s, sc.sub_out, sc.dspark_taps_tmp + (li - 39) * rows * c.hidden * 2, hc_rows * c.hidden);
+            }
             std.mem.swap(u64, &res_cur, &res_nxt);
         }
 
@@ -325,21 +365,56 @@ pub const Runner = struct {
         // 3+4. Final mHC contract + norm + sharded LM head + MultiMax + argmax
         if (compute_logits) {
             const l_rows: usize = if (logits_last_only) 1 else rows;
-            const res_ptr: u64 = if (logits_last_only) res_cur + (rows - 1) * c.hcDim() * 2 else res_cur;
-            try k.mhcContractNorm(
-                s,
-                res_ptr,
-                self.w.hc_head_fn,
-                self.w.hc_head_scale,
-                self.w.hc_head_base,
-                self.w.norm,
-                sc.layer_in,
-                l_rows,
-                c.hidden,
-                c.eps,
-                c.hc_eps,
-                c.eps,
-            );
+            if (sp_prefill and logits_last_only) {
+                const res_ptr: u64 = res_cur + (hc_rows - 1) * c.hcDim() * 2;
+                try k.mhcContractNorm(
+                    s,
+                    res_ptr,
+                    self.w.hc_head_fn,
+                    self.w.hc_head_scale,
+                    self.w.hc_head_base,
+                    self.w.norm,
+                    sc.layer_in,
+                    1,
+                    c.hidden,
+                    c.eps,
+                    c.hc_eps,
+                    c.eps,
+                );
+                try self.broadcastBf16(s, sc.layer_in, c.hidden, sp_world - 1);
+            } else if (sp_prefill) {
+                try k.mhcContractNorm(
+                    s,
+                    res_cur,
+                    self.w.hc_head_fn,
+                    self.w.hc_head_scale,
+                    self.w.hc_head_base,
+                    self.w.norm,
+                    sc.sub_out,
+                    hc_rows,
+                    c.hidden,
+                    c.eps,
+                    c.hc_eps,
+                    c.eps,
+                );
+                try self.allGatherBf16(s, sc.sub_out, sc.layer_in, hc_rows * c.hidden);
+            } else {
+                const res_ptr: u64 = if (logits_last_only) res_cur + (rows - 1) * c.hcDim() * 2 else res_cur;
+                try k.mhcContractNorm(
+                    s,
+                    res_ptr,
+                    self.w.hc_head_fn,
+                    self.w.hc_head_scale,
+                    self.w.hc_head_base,
+                    self.w.norm,
+                    sc.layer_in,
+                    l_rows,
+                    c.hidden,
+                    c.eps,
+                    c.hc_eps,
+                    c.eps,
+                );
+            }
             if (l_rows <= 16) {
                 try k.lmHeadBf16(s, sc.layer_in, self.w.lm_head_raw, sc.logits, l_rows, sh.vocab_width, c.hidden);
             } else {
@@ -350,26 +425,58 @@ pub const Runner = struct {
         }
     }
 
-    fn forwardHca(self: *const Runner, s: Stream, hca: *const weights.HcaWeights, segs: []const Seg, li: usize, sc: *const Scratch, rows: usize) !void {
+    fn forwardHca(self: *const Runner, s: Stream, hca: *const weights.HcaWeights, segs: []const Seg, li: usize, sc: *const Scratch, rows: usize, sp_out: bool) !void {
         const c = &self.w.config;
         const sh = &self.w.share;
         const k = self.k;
 
-        // 1+2. Fused q_down + kv_proj -> RMSNorm(q_down) + RMSNorm/RoPE/store(swa_kv)
-        try self.fp8(s, sc.layer_in, c.hidden, rows, hca.qdown_kv, sc.proj_tmp, sc.qmmf_part);
-        for (segs) |g| {
-            const lkv = &g.kv.layers[li].hca;
-            try k.hcaQkvPrep(s, sc.proj_tmp + g.row0 * (c.q_lora + c.head_dim) * 2, hca.q_norm, hca.kv_norm, sc.positions + g.row0 * 4, self.w.hca_inv_freq, sc.q_down + g.row0 * c.q_lora * 2, lkv.swa_kv, g.n, kv_mod.swa_mask, c.eps);
-        }
+        const pos0: usize = if (sp_out and segs.len == 1) segs[0].max_pos + 1 - rows else 0;
+        const swa_off: usize = pos0 & kv_mod.swa_mask;
+        const r_loc_hca: usize = if (sp_out) rows / self.group.?.world else rows;
+        const quarter_hca = sp_out and segs.len == 1 and (swa_off + rows <= kv_mod.swa_cap) and (pos0 % 128 == 0) and (r_loc_hca % 128 == 0);
 
-        // 3. Fused C128 Compressor (wkv+wgate in 1 BF16 GEMV + packed save + boundary flush)
-        if (hca.comp_wkv_wgate) |cw| {
-            try self.fp8(s, sc.layer_in, c.hidden, rows, cw, sc.proj_tmp, sc.qmmf_part);
+        if (quarter_hca) {
+            const grp = self.group.?;
+            const r0_rank = grp.rank * r_loc_hca;
+            const lkv = &segs[0].kv.layers[li].hca;
+            const pos_at = sc.positions + r0_rank * 4;
+            const x_at = sc.layer_in + r0_rank * c.hidden * 2;
+
+            try self.fp8(s, x_at, c.hidden, r_loc_hca, hca.qdown_kv, sc.proj_tmp, sc.qmmf_part);
+            try k.hcaQkvPrep(s, sc.proj_tmp, hca.q_norm, hca.kv_norm, pos_at, self.w.hca_inv_freq, sc.q_down + r0_rank * c.q_lora * 2, lkv.swa_kv, r_loc_hca, kv_mod.swa_mask, c.eps);
+
+            if (hca.comp_wkv_wgate) |cw| {
+                try self.fp8(s, x_at, c.hidden, r_loc_hca, cw, sc.proj_tmp, sc.qmmf_part);
+                try k.hcaCompSavePacked(s, sc.proj_tmp, hca.comp_ape, pos_at, lkv.comp_state, r_loc_hca, kv_mod.swa_mask);
+                try k.hcaCompFlush(s, lkv.comp_state, hca.comp_norm, pos_at, self.w.hca_inv_freq, lkv.comp_kv, r_loc_hca, kv_mod.swa_mask, c.eps);
+            }
+
+            try grp.lib.check(grp.lib.api.ncclGroupStart(), "ncclGroupStart");
+            try grp.lib.check(grp.lib.api.ncclAllGather(sc.q_down + r0_rank * c.q_lora * 2, sc.q_down, r_loc_hca * c.q_lora, .bf16, grp.comm, s.handle), "ncclAllGather");
+            try grp.lib.check(grp.lib.api.ncclAllGather(lkv.swa_kv + (swa_off + r0_rank) * 512 * 2, lkv.swa_kv + swa_off * 512 * 2, r_loc_hca * 512, .bf16, grp.comm, s.handle), "ncclAllGather");
+            if (hca.comp_wkv_wgate != null) {
+                const blk0 = pos0 / 128;
+                const blk_loc = r_loc_hca / 128;
+                try grp.lib.check(grp.lib.api.ncclAllGather(lkv.comp_kv + (blk0 + grp.rank * blk_loc) * 512 * 2, lkv.comp_kv + blk0 * 512 * 2, blk_loc * 512, .bf16, grp.comm, s.handle), "ncclAllGather");
+            }
+            try grp.lib.check(grp.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+        } else {
+            // 1+2. Fused q_down + kv_proj -> RMSNorm(q_down) + RMSNorm/RoPE/store(swa_kv)
+            try self.fp8(s, sc.layer_in, c.hidden, rows, hca.qdown_kv, sc.proj_tmp, sc.qmmf_part);
             for (segs) |g| {
                 const lkv = &g.kv.layers[li].hca;
-                const pos_at = sc.positions + g.row0 * 4;
-                try k.hcaCompSavePacked(s, sc.proj_tmp + g.row0 * 1024 * 2, hca.comp_ape, pos_at, lkv.comp_state, g.n, kv_mod.swa_mask);
-                try k.hcaCompFlush(s, lkv.comp_state, hca.comp_norm, pos_at, self.w.hca_inv_freq, lkv.comp_kv, g.n, kv_mod.swa_mask, c.eps);
+                try k.hcaQkvPrep(s, sc.proj_tmp + g.row0 * (c.q_lora + c.head_dim) * 2, hca.q_norm, hca.kv_norm, sc.positions + g.row0 * 4, self.w.hca_inv_freq, sc.q_down + g.row0 * c.q_lora * 2, lkv.swa_kv, g.n, kv_mod.swa_mask, c.eps);
+            }
+
+            // 3. Fused C128 Compressor (wkv+wgate in 1 BF16 GEMV + packed save + boundary flush)
+            if (hca.comp_wkv_wgate) |cw| {
+                try self.fp8(s, sc.layer_in, c.hidden, rows, cw, sc.proj_tmp, sc.qmmf_part);
+                for (segs) |g| {
+                    const lkv = &g.kv.layers[li].hca;
+                    const pos_at = sc.positions + g.row0 * 4;
+                    try k.hcaCompSavePacked(s, sc.proj_tmp + g.row0 * 1024 * 2, hca.comp_ape, pos_at, lkv.comp_state, g.n, kv_mod.swa_mask);
+                    try k.hcaCompFlush(s, lkv.comp_state, hca.comp_norm, pos_at, self.w.hca_inv_freq, lkv.comp_kv, g.n, kv_mod.swa_mask, c.eps);
+                }
             }
         }
 
@@ -419,10 +526,14 @@ pub const Runner = struct {
             try k.interleaveGroups(s, sc.q_up, sc.wo_a_out, sh.groups, rows, c.o_lora);
         }
 
-        // 10. Gate * wo_a_out -> wo_b -> TP AllReduce -> sc.sub_out [rows, 4096]
+        // 10. Gate * wo_a_out -> wo_b -> TP ReduceScatter (sp_out) or AllReduce -> sc.layer_in / sc.sub_out
         try k.sigmoidMulBf16(s, sc.wo_a_out, sc.o_gate, sc.wo_a_out, rows * sh.o_width);
         try self.fp8(s, sc.wo_a_out, sh.o_width, rows, hca.wo_b, sc.sub_out, sc.qmmf_part);
-        try self.allReduceBf16(s, sc.sub_out, sc.tp_gather, rows * c.hidden);
+        if (sp_out) {
+            try self.reduceScatterBf16(s, sc.sub_out, sc.layer_in, (rows / self.group.?.world) * c.hidden);
+        } else {
+            try self.allReduceBf16(s, sc.sub_out, sc.tp_gather, rows * c.hidden);
+        }
     }
 
     fn forwardHcaTab(self: *const Runner, s: Stream, hca: *const weights.HcaWeights, li: usize, sc: *const Scratch, rows: usize) !void {
@@ -646,27 +757,109 @@ pub const Runner = struct {
         try self.allReduceBf16(s, sc.sub_out, sc.tp_gather, rows * c.hidden);
     }
 
-    fn forwardDsa(self: *const Runner, s: Stream, dsa: *const weights.DsaWeights, segs: []const Seg, li: usize, sc: *const Scratch, rows: usize) !void {
+    fn forwardDsa(self: *const Runner, s: Stream, dsa: *const weights.DsaWeights, segs: []const Seg, li: usize, sc: *const Scratch, rows: usize, sp_out: bool) !void {
         const c = &self.w.config;
         const sh = &self.w.share;
         const k = self.k;
 
-        // 1+2. Fused q_a + kv_a [rows, 1600] -> q_down + mla_kv store
-        try self.fp8(s, sc.layer_in, c.hidden, rows, dsa.qa_kva, sc.proj_tmp, sc.qmmf_part);
-        for (segs) |g| try k.dsaQkvPrep(s, sc.proj_tmp + g.row0 * 1600 * 2, dsa.q_a_norm, dsa.kv_a_norm, sc.positions + g.row0 * 4, self.w.mla_inv_freq, sc.q_down + g.row0 * c.mla_q_lora * 2, g.kv.layers[li].dsa.mla_kv, g.n, c.eps);
+        if (sp_out and segs.len == 1) {
+            const grp = self.group.?;
+            const r_loc = rows / grp.world;
+            const r0_rank = grp.rank * r_loc;
+            const lkv = &segs[0].kv.layers[li].dsa;
+            const pos0 = segs[0].max_pos + 1 - rows;
+            const x_at = sc.layer_in + r0_rank * c.hidden * 2;
+            const pos_at = sc.positions + r0_rank * 4;
 
-        // 3. Lightning Indexer: always update idx_k cache! (wk -> LayerNorm -> NeoX RoPE[0..64) -> Hadamard-128 -> store)
-        try self.fp8(s, sc.layer_in, c.hidden, rows, dsa.idx_wk, sc.idx_k, sc.qmmf_part);
-        try k.layerNorm(s, sc.idx_k, dsa.idx_k_norm_w, dsa.idx_k_norm_b, sc.idx_k, rows, c.index_dim, c.eps);
-        try k.ropeNeox(s, sc.idx_k, sc.positions, self.w.mla_inv_freq, rows, 1, c.index_dim, 0);
-        try k.hadamard128(s, sc.idx_k, rows);
-        for (segs) |g| try k.dsaIdxKStore(s, sc.idx_k + g.row0 * 128 * 2, sc.positions + g.row0 * 4, g.kv.layers[li].dsa.idx_k, g.kv.layers[li].dsa.idx_k_sc, g.n);
+            // 1+2. Row-sharded q_a + kv_a -> q_down + mla_kv store
+            try self.fp8(s, x_at, c.hidden, r_loc, dsa.qa_kva, sc.proj_tmp, sc.qmmf_part);
+            try k.dsaQkvPrep(s, sc.proj_tmp, dsa.q_a_norm, dsa.kv_a_norm, pos_at, self.w.mla_inv_freq, sc.q_down + r0_rank * c.mla_q_lora * 2, lkv.mla_kv, r_loc, c.eps);
+
+            // 3. Row-sharded Lightning Indexer K store
+            try self.fp8(s, x_at, c.hidden, r_loc, dsa.idx_wk, sc.idx_k, sc.qmmf_part);
+            try k.layerNorm(s, sc.idx_k, dsa.idx_k_norm_w, dsa.idx_k_norm_b, sc.idx_k, r_loc, c.index_dim, c.eps);
+            try k.ropeNeox(s, sc.idx_k, pos_at, self.w.mla_inv_freq, r_loc, 1, c.index_dim, 0);
+            try k.hadamard128(s, sc.idx_k, r_loc);
+            try k.dsaIdxKStore(s, sc.idx_k, pos_at, lkv.idx_k, lkv.idx_k_sc, r_loc);
+
+            try grp.lib.check(grp.lib.api.ncclGroupStart(), "ncclGroupStart");
+            try grp.lib.check(grp.lib.api.ncclAllGather(sc.q_down + r0_rank * c.mla_q_lora * 2, sc.q_down, r_loc * c.mla_q_lora, .bf16, grp.comm, s.handle), "ncclAllGather");
+            try grp.lib.check(grp.lib.api.ncclAllGather(lkv.mla_kv + (pos0 + r0_rank) * 576 * 2, lkv.mla_kv + pos0 * 576 * 2, r_loc * 576, .bf16, grp.comm, s.handle), "ncclAllGather");
+            try grp.lib.check(grp.lib.api.ncclAllGather(lkv.idx_k + (pos0 + r0_rank) * 128, lkv.idx_k + pos0 * 128, r_loc * 128, .u8, grp.comm, s.handle), "ncclAllGather");
+            try grp.lib.check(grp.lib.api.ncclAllGather(lkv.idx_k_sc + (pos0 + r0_rank) * 4, lkv.idx_k_sc + pos0 * 4, r_loc, .f32, grp.comm, s.handle), "ncclAllGather");
+            try grp.lib.check(grp.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+        } else {
+            // 1+2. Fused q_a + kv_a [rows, 1600] -> q_down + mla_kv store
+            try self.fp8(s, sc.layer_in, c.hidden, rows, dsa.qa_kva, sc.proj_tmp, sc.qmmf_part);
+            for (segs) |g| try k.dsaQkvPrep(s, sc.proj_tmp + g.row0 * 1600 * 2, dsa.q_a_norm, dsa.kv_a_norm, sc.positions + g.row0 * 4, self.w.mla_inv_freq, sc.q_down + g.row0 * c.mla_q_lora * 2, g.kv.layers[li].dsa.mla_kv, g.n, c.eps);
+
+            // 3. Lightning Indexer: always update idx_k cache! (wk -> LayerNorm -> NeoX RoPE[0..64) -> Hadamard-128 -> store)
+            try self.fp8(s, sc.layer_in, c.hidden, rows, dsa.idx_wk, sc.idx_k, sc.qmmf_part);
+            try k.layerNorm(s, sc.idx_k, dsa.idx_k_norm_w, dsa.idx_k_norm_b, sc.idx_k, rows, c.index_dim, c.eps);
+            try k.ropeNeox(s, sc.idx_k, sc.positions, self.w.mla_inv_freq, rows, 1, c.index_dim, 0);
+            try k.hadamard128(s, sc.idx_k, rows);
+            for (segs) |g| try k.dsaIdxKStore(s, sc.idx_k + g.row0 * 128 * 2, sc.positions + g.row0 * 4, g.kv.layers[li].dsa.idx_k, g.kv.layers[li].dsa.idx_k_sc, g.n);
+        }
 
         // 4. Score & select top-2048 + SWA-128 ONLY when max_pos + 1 > 2176!
         const dense_width = c.index_topk + c.sliding_window; // 2176
         var any_sparse = false;
         for (segs) |g| any_sparse = any_sparse or g.max_pos + 1 > dense_width;
-        if (any_sparse) {
+        const idx_overlap = sp_out and any_sparse and self.comm_stream != null and self.ev_shared != null and self.ev_comm != null;
+        if (any_sparse and sp_out and segs.len == 1) {
+            const grp = self.group.?;
+            const r_loc = rows / grp.world;
+            const r0_rank = grp.rank * r_loc;
+            const g = segs[0];
+            const lkv = &g.kv.layers[li].dsa;
+            const pos_r = sc.positions + r0_rank * 4;
+
+            try self.fp8(s, sc.q_down + r0_rank * c.mla_q_lora * 2, c.mla_q_lora, r_loc, dsa.idx_wq_b, sc.idx_q, sc.qmmf_part);
+            try k.ropeNeox(s, sc.idx_q, pos_r, self.w.mla_inv_freq, r_loc, c.index_heads, c.index_dim, 0);
+            try k.hadamard128(s, sc.idx_q, r_loc * c.index_heads);
+            try self.fp8(s, sc.layer_in + r0_rank * c.hidden * 2, c.hidden, r_loc, dsa.idx_weights_proj, sc.idx_w, sc.qmmf_part);
+
+            const w_scale: f32 = @floatCast(1.0 / (@sqrt(@as(f64, @floatFromInt(c.index_dim))) * @sqrt(@as(f64, @floatFromInt(c.index_heads)))));
+            const use_fi = (r_loc >= 16 and dsa.fi_gate != 0 and dsa.fi_bias != 0);
+            const fi_gates = sc.qmmf_part; // F32 [r_loc, 64]
+            const fi_q_sel = fi_gates + ((r_loc * 64 * 4 + 255) & ~@as(usize, 255)); // BF16 [r_loc, 8, 128]
+            const fi_w_sel = fi_q_sel + ((r_loc * 8 * 128 * 2 + 255) & ~@as(usize, 255)); // F32 [r_loc, 8]
+            if (use_fi) {
+                try k.bf16GemmF32Mma(s, sc.layer_in + r0_rank * c.hidden * 2, dsa.fi_gate, fi_gates, r_loc, 64, c.hidden);
+                try k.dsaFlashindexerSelect(s, fi_gates, dsa.fi_bias, sc.idx_q, sc.idx_w, fi_q_sel, fi_w_sel, r_loc, w_scale);
+            }
+
+            const score_rows = @min(sc.max_rows, 64);
+            var lr: usize = 0;
+            while (lr < r_loc) : (lr += score_rows) {
+                const b = @min(score_rows, r_loc - lr);
+                const global_r = r0_rank + lr;
+                const slice_max = g.max_pos - (rows - (global_r + b));
+                if (slice_max + 1 <= dense_width) continue;
+                const older = if (g.older_ceil > 0) g.older_ceil else (slice_max + 1 - c.sliding_window);
+                if (b * older > score_rows * sc.capacity) return error.IndexerScoresTooSmall;
+                const pos_at = sc.positions + global_r * 4;
+                if (use_fi) {
+                    try k.dsaFlashindexerScoresFp8(s, fi_q_sel + lr * 8 * 128 * 2, lkv.idx_k, lkv.idx_k_sc, fi_w_sel + lr * 8 * 4, pos_at, sc.idx_scores, b, older, c.sliding_window);
+                } else {
+                    try k.dsaIndexerScoresMma(s, sc.idx_q + lr * c.index_heads * c.index_dim * 2, lkv.idx_k, lkv.idx_k_sc, sc.idx_w + lr * c.index_heads * 2, pos_at, sc.idx_scores, b, older, c.sliding_window, w_scale);
+                }
+                try k.dsaSelectTopk(s, sc.idx_scores, pos_at, sc.idx_sel + global_r * dense_width * 4, sc.idx_cnt + global_r * 4, b, older, c.index_topk, c.sliding_window);
+            }
+
+            const cs: Stream = if (idx_overlap) self.comm_stream.? else s;
+            if (idx_overlap) {
+                try self.ev_shared.?.record(s);
+                try cs.wait(self.ev_shared.?);
+            }
+            try grp.lib.check(grp.lib.api.ncclGroupStart(), "ncclGroupStart");
+            try grp.lib.check(grp.lib.api.ncclAllGather(sc.idx_sel + r0_rank * dense_width * 4, sc.idx_sel, r_loc * dense_width, .u32, grp.comm, cs.handle), "ncclAllGather");
+            try grp.lib.check(grp.lib.api.ncclAllGather(sc.idx_cnt + r0_rank * 4, sc.idx_cnt, r_loc, .u32, grp.comm, cs.handle), "ncclAllGather");
+            try grp.lib.check(grp.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+            if (idx_overlap) {
+                try self.ev_comm.?.record(cs);
+            }
+        } else if (any_sparse) {
             try self.fp8(s, sc.q_down, c.mla_q_lora, rows, dsa.idx_wq_b, sc.idx_q, sc.qmmf_part);
             try k.ropeNeox(s, sc.idx_q, sc.positions, self.w.mla_inv_freq, rows, c.index_heads, c.index_dim, 0);
             try k.hadamard128(s, sc.idx_q, rows * c.index_heads);
@@ -709,6 +902,9 @@ pub const Runner = struct {
         try self.fp8(s, sc.q_down, c.mla_q_lora, rows, dsa.qb_ogate, sc.proj_tmp, sc.qmmf_part);
         try k.dsaQbRopeSplit(s, sc.proj_tmp, sc.positions, self.w.mla_inv_freq, sc.q_up, sc.o_gate, rows, sh.heads, sh.dsa_o_width);
         try k.dsaAbsorbQ(s, sc.q_up, dsa.wk, sc.q_abs, rows, sh.heads);
+        if (idx_overlap) {
+            try s.wait(self.ev_comm.?);
+        }
 
         // 7. MLA-DSA Attention (SM121a Tensor-Core MMA + Split-K when H_loc==16!) -> sc.attn_o -> expand_v
         const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(q_head))));
@@ -729,13 +925,17 @@ pub const Runner = struct {
         try self.allReduceBf16(s, sc.vha_z, sc.vha_z_all, rows * c.vha_rank * c.mla_v_dim);
         try k.vhaVAddBf16(s, sc.attn_o_v, dsa.vha_v, sc.vha_z, rows, sh.heads, c.mla_v_dim);
 
-        // 9. Gate * o_v -> o_proj -> TP AllReduce -> sc.sub_out [rows, 4096]
+        // 9. Gate * o_v -> o_proj -> TP ReduceScatter (sp_out) or AllReduce -> sc.layer_in / sc.sub_out
         try k.sigmoidMulBf16(s, sc.attn_o_v, sc.o_gate, sc.attn_o_v, rows * sh.dsa_o_width);
         try self.fp8(s, sc.attn_o_v, sh.dsa_o_width, rows, dsa.o_proj, sc.sub_out, sc.qmmf_part);
-        try self.allReduceBf16(s, sc.sub_out, sc.tp_gather, rows * c.hidden);
+        if (sp_out) {
+            try self.reduceScatterBf16(s, sc.sub_out, sc.layer_in, (rows / self.group.?.world) * c.hidden);
+        } else {
+            try self.allReduceBf16(s, sc.sub_out, sc.tp_gather, rows * c.hidden);
+        }
     }
 
-    fn forwardDenseMlp(self: *const Runner, s: Stream, mlp: *const weights.DenseMlpWeights, sc: *const Scratch, rows: usize) !void {
+    fn forwardDenseMlp(self: *const Runner, s: Stream, mlp: *const weights.DenseMlpWeights, sc: *const Scratch, rows: usize, sp_out: bool) !void {
         const c = &self.w.config;
         const sh = &self.w.share;
         const k = self.k;
@@ -743,10 +943,18 @@ pub const Runner = struct {
         try self.fp8(s, sc.layer_in, c.hidden, rows, mlp.gate_up, sc.proj_tmp, sc.qmmf_part);
         try k.situAndMulPacked(s, sc.proj_tmp, sc.dense_gate, rows, sh.dense_width, c.situ_beta, c.situ_linear_beta);
         try self.fp8(s, sc.dense_gate, sh.dense_width, rows, mlp.down, sc.sub_out, sc.qmmf_part);
-        try self.allReduceBf16(s, sc.sub_out, sc.tp_gather, rows * c.hidden);
+        if (sp_out) {
+            try self.reduceScatterBf16(s, sc.sub_out, sc.layer_in, (rows / self.group.?.world) * c.hidden);
+        } else {
+            try self.allReduceBf16(s, sc.sub_out, sc.tp_gather, rows * c.hidden);
+        }
     }
 
     pub fn forwardMoe(self: *const Runner, s: Stream, moe: *const weights.MoeWeights, sc: *const Scratch, rows: usize) !void {
+        return self.forwardMoeSp(s, moe, sc, rows, false);
+    }
+
+    fn forwardMoeSp(self: *const Runner, s: Stream, moe: *const weights.MoeWeights, sc: *const Scratch, rows: usize, sp_out: bool) !void {
         const c = &self.w.config;
         const sh = &self.w.share;
         const k = self.k;
@@ -766,6 +974,33 @@ pub const Runner = struct {
 
         const overlap_shared = rows >= 256 and self.group != null and self.group.?.world > 1 and
             self.comm_stream != null and self.ev_shared != null and self.ev_comm != null;
+        if (sp_out) {
+            const r_loc = rows / self.group.?.world;
+            try self.fp8(s, sc.dense_gate, sh.moe_width, rows, moe.shared_w2, sc.shared_out, sc.qmmf_part);
+            if (overlap_shared) {
+                const cs = self.comm_stream.?;
+                try self.ev_shared.?.record(s);
+                try cs.wait(self.ev_shared.?);
+                try self.reduceScatterBf16(cs, sc.shared_out, sc.layer_in, r_loc * c.hidden);
+                try self.ev_comm.?.record(cs);
+
+                try k.moeGrouped(s, sc.latent_in, moe.w1_q, moe.w1_s, moe.w3_q, moe.w3_s, moe.w2_q, moe.w2_s, sc.topk_ids, sc.topk_w, sc.route_counts, sc.route_offsets, sc.route_cursor, sc.route_list, sc.moe_mid, sc.moe_part, sc.routed_out, rows, c.topk, c.experts, sh.moe_width, c.moe_latent, c.moe_latent, sh.moe_width, c.situ_beta, c.situ_linear_beta);
+
+                try s.wait(self.ev_comm.?);
+                try self.reduceScatterBf16(s, sc.routed_out, sc.latent_in, r_loc * c.moe_latent);
+            } else {
+                try k.moeGrouped(s, sc.latent_in, moe.w1_q, moe.w1_s, moe.w3_q, moe.w3_s, moe.w2_q, moe.w2_s, sc.topk_ids, sc.topk_w, sc.route_counts, sc.route_offsets, sc.route_cursor, sc.route_list, sc.moe_mid, sc.moe_part, sc.routed_out, rows, c.topk, c.experts, sh.moe_width, c.moe_latent, c.moe_latent, sh.moe_width, c.situ_beta, c.situ_linear_beta);
+                try self.reduceScatterBf16(s, sc.shared_out, sc.layer_in, r_loc * c.hidden);
+                try self.reduceScatterBf16(s, sc.routed_out, sc.latent_in, r_loc * c.moe_latent);
+            }
+
+            // 5. Post-combine ONLY on this rank s r_loc rows (4x less compute!) -> sc.layer_in [r_loc, 4096]
+            try k.rmsNorm(s, sc.latent_in, moe.latent_norm, sc.latent_in, r_loc, c.moe_latent, c.eps);
+            try self.fp8(s, sc.latent_in, c.moe_latent, r_loc, moe.fc2_latent, sc.sub_out, sc.qmmf_part);
+            try k.addBf16(s, sc.sub_out, sc.layer_in, sc.layer_in, r_loc * c.hidden);
+            return;
+        }
+
         if (overlap_shared) {
             const cs = self.comm_stream.?;
             // Shared expert down projection first -> overlap its ncclAllReduce on comm_stream with moeGrouped on s!

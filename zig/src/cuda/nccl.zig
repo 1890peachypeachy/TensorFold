@@ -61,6 +61,7 @@ pub const Api = struct {
     ncclCommDestroy: *const fn (Comm) callconv(.c) R,
     ncclGetErrorString: *const fn (R) callconv(.c) ?[*:0]const u8,
     ncclAllReduce: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
+    ncclReduceScatter: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
     ncclAllGather: *const fn (D, D, usize, DataType, Comm, abi.Stream) callconv(.c) R,
     ncclBroadcast: *const fn (D, D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
     ncclSend: *const fn (D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,

@@ -389,7 +389,7 @@ extern "C" __global__ void tf_ernie55_router_topk(
     for (int i = 0; i < nloc; ++i) {
         int idx = lane + i * 32;
         if (idx < E) {
-            float sc = sr[idx];
+            float sc = isfinite(sr[idx]) ? sr[idx] : -1e30f;
             my_sc[i] = sc;
             my_sel[i] = sc + bias[idx];
         } else {
@@ -426,6 +426,7 @@ extern "C" __global__ void tf_ernie55_router_topk(
                 best_sc = osc;
             }
         }
+        if (best_i >= E) best_i = k % E;
         sel_ids[k] = best_i;
         sel_w[k] = best_sc;
         wsum += best_sc;

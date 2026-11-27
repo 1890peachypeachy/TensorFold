@@ -385,7 +385,7 @@ extern "C" __global__ void tf_ernie55_dsa_attn(
     bool v1 = (h1 < H_loc);
 
     int pos = positions[r];
-    bool use_idx = (indices != nullptr && counts != nullptr);
+    bool use_idx = (indices != nullptr && counts != nullptr && (pos + 1 > idx_stride));
     int total_k = use_idx ? counts[r] : (pos + 1);
     const int32_t* idx_row = use_idx ? (indices + (int64_t)r * idx_stride) : nullptr;
 
@@ -838,7 +838,7 @@ __device__ __forceinline__ void dsa_attn_mma_impl(
 ) {
 
     int pos = positions[r];
-    bool use_idx = (indices != nullptr && counts != nullptr);
+    bool use_idx = (indices != nullptr && counts != nullptr && (pos + 1 > idx_stride));
     int total_k = use_idx ? counts[r] : (pos + 1);
     const int32_t* idx_row = use_idx ? (indices + (int64_t)r * idx_stride) : nullptr;
 
@@ -1047,7 +1047,13 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_attn_mma_tab(
     int sp = blockIdx.x;
     if (r >= rows) return;
     int seg = row_seg[r];
-    if (seg < 0) return;
+    if (seg < 0) {
+        if (sp == 0) {
+            __nv_bfloat16* orow = out_lat + (int64_t)r * 16 * 512;
+            for (int i = threadIdx.x; i < 16 * 512; i += blockDim.x) orow[i] = f2bf(0.0f);
+        }
+        return;
+    }
     int splits = tf_dsa_attn_splits(seg_tab[seg].n, max_sp);
     if (sp >= splits) return;
     const __nv_bfloat16* mla_kv = reinterpret_cast<const __nv_bfloat16*>(kv_ptrs[seg * layer_off + 0]);
@@ -1418,10 +1424,15 @@ extern "C" __global__ void tf_ernie55_dsa_qkv_prep_tab(
 ) {
     int r = blockIdx.x;
     if (r >= rows) return;
+    int tid = threadIdx.x;
     int seg = row_seg[r];
-    if (seg < 0) return;
+    if (seg < 0) {
+        __nv_bfloat16* qdst = q_down + (int64_t)r * 1024;
+        qdst[tid] = f2bf(0.0f); qdst[tid + 256] = f2bf(0.0f); qdst[tid + 512] = f2bf(0.0f); qdst[tid + 768] = f2bf(0.0f);
+        return;
+    }
     __nv_bfloat16* mla_kv = reinterpret_cast<__nv_bfloat16*>(kv_ptrs[seg * layer_off + 0]);
-    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    int lane = tid & 31, warp = tid >> 5;
     __shared__ float s_red[8];
     const __nv_bfloat16* src = packed + (int64_t)r * 1600;
     float q0 = bf2f(src[tid]), q1 = bf2f(src[tid + 256]), q2 = bf2f(src[tid + 512]), q3 = bf2f(src[tid + 768]);
