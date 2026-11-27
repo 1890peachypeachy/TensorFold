@@ -52,18 +52,30 @@ extern "C" __global__ void tf_ernie55_dsa_kv_store(
     if (threadIdx.x < 64) dst[512 + threadIdx.x] = sp[threadIdx.x];
 }
 
-// Store indexer key k_idx [rows, 128] into idx_k[positions[r], 0..127]
-// Launch: grid=(rows), block=(128)
+// Quantize & store indexer key k_idx [rows, 128] BF16 -> FP8 idx_k[pos, 0..127] + F32 idx_k_sc[pos]
+// Launch: grid=(cdiv(rows, 4)), block=(128) -> 1 warp per row, 4 elems per lane
 extern "C" __global__ void tf_ernie55_dsa_idx_k_store(
     const __nv_bfloat16* __restrict__ k_idx,
     const int32_t* __restrict__ positions,
-    __nv_bfloat16* __restrict__ idx_k,
+    uint8_t* __restrict__ idx_k,
+    float* __restrict__ idx_k_sc,
     int rows
 ) {
-    int r = blockIdx.x;
-    int d = threadIdx.x;
-    if (r >= rows || d >= 128) return;
-    idx_k[(int64_t)positions[r] * 128 + d] = k_idx[(int64_t)r * 128 + d];
+    int r = blockIdx.x * 4 + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    if (r >= rows) return;
+    uint2 raw = *reinterpret_cast<const uint2*>(k_idx + (int64_t)r * 128 + lane * 4);
+    const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    float v0 = __bfloat162float(b[0]), v1 = __bfloat162float(b[1]);
+    float v2 = __bfloat162float(b[2]), v3 = __bfloat162float(b[3]);
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    float sc = fmaxf(amax, 1e-12f) * (1.0f / 448.0f), inv = 1.0f / sc;
+    int pos = positions[r];
+    if (lane == 0) idx_k_sc[pos] = sc;
+    uint8_t q[4] = {__nv_fp8_e4m3(v0 * inv).__x, __nv_fp8_e4m3(v1 * inv).__x, __nv_fp8_e4m3(v2 * inv).__x, __nv_fp8_e4m3(v3 * inv).__x};
+    *reinterpret_cast<uint32_t*>(idx_k + (int64_t)pos * 128 + lane * 4) = *reinterpret_cast<uint32_t*>(q);
 }
 
 // Absorb Q into latent space:
@@ -491,7 +503,8 @@ __device__ __forceinline__ void idx_mma16816(float* c, const uint32_t* a, const 
 // Launch: grid=(ceil(max_older / 64), rows), block=(128), smem = (64 + 64) * TF_IDX_LD * 2 + 4 * 64 * 4.
 extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_indexer_scores_mma(
     const __nv_bfloat16* __restrict__ q_idx,    // [rows, 64, 128]
-    const __nv_bfloat16* __restrict__ idx_k,    // [capacity, 128]
+    const uint8_t* __restrict__ idx_k,          // [capacity, 128] FP8 E4M3
+    const float* __restrict__ idx_k_sc,         // [capacity] F32
     const __nv_bfloat16* __restrict__ weights,  // [rows, 64]
     const int32_t* __restrict__ positions,      // [rows]
     float* __restrict__ scores,                 // [rows, max_older]
@@ -518,7 +531,18 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_indexer_scores_
         *reinterpret_cast<uint4*>(qs + row * TF_IDX_LD + c) = *reinterpret_cast<const uint4*>(qr + row * 128 + c);
         const int t = t0 + row;
         uint4 v = make_uint4(0, 0, 0, 0);
-        if (t < n_older) v = *reinterpret_cast<const uint4*>(idx_k + (int64_t)t * 128 + c);
+        if (t < n_older) {
+            uint2 raw = *reinterpret_cast<const uint2*>(idx_k + (int64_t)t * 128 + c);
+            const float sc = idx_k_sc[t];
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&raw);
+            __nv_bfloat16* out_bf = reinterpret_cast<__nv_bfloat16*>(&v);
+            #pragma unroll
+            for (int k_i = 0; k_i < 8; ++k_i) {
+                __nv_fp8_e4m3 f8;
+                f8.__x = bytes[k_i];
+                out_bf[k_i] = f2bf(float(f8) * sc);
+            }
+        }
         *reinterpret_cast<uint4*>(ks + row * TF_IDX_LD + c) = v;
     }
     __syncthreads();
@@ -946,7 +970,8 @@ __device__ __forceinline__ void idx_mma16832_fp8(float* c, const uint32_t* a, co
 
 extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_indexer_scores_fp8_mma(
     const __nv_bfloat16* __restrict__ q_idx,    // [rows, 64, 128]
-    const __nv_bfloat16* __restrict__ idx_k,    // [capacity, 128]
+    const uint8_t* __restrict__ idx_k,          // [capacity, 128] FP8 E4M3
+    const float* __restrict__ idx_k_sc,         // [capacity] F32
     const __nv_bfloat16* __restrict__ weights,  // [rows, 64]
     const int32_t* __restrict__ positions,      // [rows]
     float* __restrict__ scores,                 // [rows, max_older]
@@ -982,28 +1007,24 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_indexer_scores_
     const int g = lane >> 2;
     const int tq = lane & 3;
 
-    // 1. Load & quantize ks[64, 128] ONCE (4 warps x 16 rows each, 1 warp = 1 row -> 4 elems/lane!)
-    for (int row = warp; row < 64; row += 4) {
-        int t = t0 + row;
-        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
-        if (t < max_n_older) {
-            uint2 raw = *reinterpret_cast<const uint2*>(idx_k + (int64_t)t * 128 + lane * 4);
-            const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
-            v0 = __bfloat162float(b[0]); v1 = __bfloat162float(b[1]);
-            v2 = __bfloat162float(b[2]); v3 = __bfloat162float(b[3]);
-        }
-        float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+    // 1. Load pre-quantized FP8 ks[64, 128] + k_sc[64] ONCE (8 threads/row x 16-byte uint4!)
+    {
+        const int kg = tid >> 3, kc = (tid & 7) * 16;
         #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
-        float sc = fmaxf(amax, 1e-12f) * (1.0f / 448.0f);
-        float inv = 1.0f / sc;
-        if (lane == 0) k_sc[row] = sc;
-        uint8_t q[4];
-        q[0] = __nv_fp8_e4m3(v0 * inv).__x;
-        q[1] = __nv_fp8_e4m3(v1 * inv).__x;
-        q[2] = __nv_fp8_e4m3(v2 * inv).__x;
-        q[3] = __nv_fp8_e4m3(v3 * inv).__x;
-        *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + lane * 4) = *reinterpret_cast<uint32_t*>(q);
+        for (int iter = 0; iter < 4; ++iter) {
+            int row = iter * 16 + kg;
+            int t = t0 + row;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (t < max_n_older) v = *reinterpret_cast<const uint4*>(idx_k + (int64_t)t * 128 + kc);
+            *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + kc + 0) = v.x;
+            *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + kc + 4) = v.y;
+            *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + kc + 8) = v.z;
+            *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + kc + 12) = v.w;
+        }
+        if (tid < 64) {
+            int t = t0 + tid;
+            k_sc[tid] = (t < max_n_older) ? idx_k_sc[t] : 1.0f;
+        }
     }
 
     // 2. Loop over the 4 query rows sharing ks!
@@ -1162,7 +1183,8 @@ __device__ __forceinline__ void fi_mma_m16n8k32_fp8(float* c, const uint32_t* a,
 // Launch: grid=(cdiv(max_older, 64), cdiv(rows, 8)), block=(128)
 extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_flashindexer_scores_fp8_8h_mma(
     const __nv_bfloat16* __restrict__ q_sel,
-    const __nv_bfloat16* __restrict__ idx_k,
+    const uint8_t* __restrict__ idx_k,
+    const float* __restrict__ idx_k_sc,
     const float* __restrict__ w_sel,
     const int32_t* __restrict__ positions,
     float* __restrict__ scores,
@@ -1192,22 +1214,23 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_flashindexer_sc
     __shared__ float k_sc[64], q_sc[64], q_wt[64];
 
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tq = lane & 3;
-    for (int row = warp; row < 64; row += 4) {
-        int t = t0 + row;
-        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
-        if (t < max_n_older) {
-            uint2 raw = *reinterpret_cast<const uint2*>(idx_k + (int64_t)t * 128 + lane * 4);
-            const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
-            v0 = __bfloat162float(b[0]); v1 = __bfloat162float(b[1]);
-            v2 = __bfloat162float(b[2]); v3 = __bfloat162float(b[3]);
+    {
+        const int kg = tid >> 3, kc = (tid & 7) * 16;
+        #pragma unroll
+        for (int iter = 0; iter < 4; ++iter) {
+            int row = iter * 16 + kg;
+            int t = t0 + row;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (t < max_n_older) v = *reinterpret_cast<const uint4*>(idx_k + (int64_t)t * 128 + kc);
+            *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + kc + 0) = v.x;
+            *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + kc + 4) = v.y;
+            *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + kc + 8) = v.z;
+            *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + kc + 12) = v.w;
         }
-        float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
-        float sc = fmaxf(amax, 1e-12f) * (1.0f / 448.0f), inv = 1.0f / sc;
-        if (lane == 0) k_sc[row] = sc;
-        uint8_t q[4] = {__nv_fp8_e4m3(v0 * inv).__x, __nv_fp8_e4m3(v1 * inv).__x, __nv_fp8_e4m3(v2 * inv).__x, __nv_fp8_e4m3(v3 * inv).__x};
-        *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + lane * 4) = *reinterpret_cast<uint32_t*>(q);
+        if (tid < 64) {
+            int t = t0 + tid;
+            k_sc[tid] = (t < max_n_older) ? idx_k_sc[t] : 1.0f;
+        }
     }
     for (int qi = warp; qi < nr * 8; qi += 4) {
         int dr = qi >> 3, h = qi & 7;

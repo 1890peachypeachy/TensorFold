@@ -539,7 +539,7 @@ pub const Runner = struct {
         try k.layerNorm(s, sc.idx_k, dsa.idx_k_norm_w, dsa.idx_k_norm_b, sc.idx_k, rows, c.index_dim, c.eps);
         try k.ropeNeox(s, sc.idx_k, sc.positions, self.w.mla_inv_freq, rows, 1, c.index_dim, 0);
         try k.hadamard128(s, sc.idx_k, rows);
-        for (segs) |g| try k.dsaIdxKStore(s, sc.idx_k + g.row0 * 128 * 2, sc.positions + g.row0 * 4, g.kv.layers[li].dsa.idx_k, g.n);
+        for (segs) |g| try k.dsaIdxKStore(s, sc.idx_k + g.row0 * 128 * 2, sc.positions + g.row0 * 4, g.kv.layers[li].dsa.idx_k, g.kv.layers[li].dsa.idx_k_sc, g.n);
 
         // 4. Score & select top-2048 + SWA-128 ONLY when max_pos + 1 > 2176!
         const dense_width = c.index_topk + c.sliding_window; // 2176
@@ -574,9 +574,9 @@ pub const Runner = struct {
                 if (b * older > score_rows * sc.capacity) return error.IndexerScoresTooSmall;
                 const pos_at = sc.positions + r0 * 4;
                 if (use_fi) {
-                    try k.dsaFlashindexerScoresFp8(s, fi_q_sel + r0 * 8 * 128 * 2, g.kv.layers[li].dsa.idx_k, fi_w_sel + r0 * 8 * 4, pos_at, sc.idx_scores, b, older, c.sliding_window);
+                    try k.dsaFlashindexerScoresFp8(s, fi_q_sel + r0 * 8 * 128 * 2, g.kv.layers[li].dsa.idx_k, g.kv.layers[li].dsa.idx_k_sc, fi_w_sel + r0 * 8 * 4, pos_at, sc.idx_scores, b, older, c.sliding_window);
                 } else {
-                    try k.dsaIndexerScoresMma(s, sc.idx_q + r0 * c.index_heads * c.index_dim * 2, g.kv.layers[li].dsa.idx_k, sc.idx_w + r0 * c.index_heads * 2, pos_at, sc.idx_scores, b, older, c.sliding_window, w_scale);
+                    try k.dsaIndexerScoresMma(s, sc.idx_q + r0 * c.index_heads * c.index_dim * 2, g.kv.layers[li].dsa.idx_k, g.kv.layers[li].dsa.idx_k_sc, sc.idx_w + r0 * c.index_heads * 2, pos_at, sc.idx_scores, b, older, c.sliding_window, w_scale);
                 }
                 try k.dsaSelectTopk(s, sc.idx_scores, pos_at, sc.idx_sel + r0 * dense_width * 4, sc.idx_cnt + r0 * 4, b, older, c.index_topk, c.sliding_window);
             }

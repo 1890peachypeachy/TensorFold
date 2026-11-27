@@ -19,7 +19,8 @@ pub const HcaKv = struct {
 
 pub const DsaKv = struct {
     mla_kv: u64, // BF16 [capacity, 576]
-    idx_k: u64, // BF16 [capacity, 128]
+    idx_k: u64, // FP8 E4M3 [capacity, 128]
+    idx_k_sc: u64, // F32 [capacity]
 };
 
 pub const LayerKv = union(enum) {
@@ -46,7 +47,9 @@ pub const KvCache = struct {
                 total = alignUp(total, 256);
                 total += capacity * 576 * 2;
                 total = alignUp(total, 256);
-                total += capacity * 128 * 2;
+                total += capacity * 128;
+                total = alignUp(total, 256);
+                total += capacity * 4;
             } else {
                 total = alignUp(total, 256);
                 total += swa_cap * 512 * 2;
@@ -71,8 +74,11 @@ pub const KvCache = struct {
                 off += capacity * 576 * 2;
                 off = alignUp(off, 256);
                 const idx_k = buf.ptr + off;
-                off += capacity * 128 * 2;
-                layers[li] = .{ .dsa = .{ .mla_kv = mla_kv, .idx_k = idx_k } };
+                off += capacity * 128;
+                off = alignUp(off, 256);
+                const idx_k_sc = buf.ptr + off;
+                off += capacity * 4;
+                layers[li] = .{ .dsa = .{ .mla_kv = mla_kv, .idx_k = idx_k, .idx_k_sc = idx_k_sc } };
             } else {
                 off = alignUp(off, 256);
                 const swa_kv = buf.ptr + off;

@@ -704,7 +704,7 @@ pub const Engine = struct {
         var total: u64 = 0;
         for (0..e.w.loaded_layers) |li| {
             if (e.w.config.isDsa(@intCast(li))) {
-                total += at * (576 + 128) * 2;
+                total += at * (576 * 2 + 128 + 4);
             } else {
                 total += @as(u64, @min(at, snap_ring)) * 512 * 2 + (at / e.w.config.compress_ratio) * 512 * 2;
             }
@@ -725,7 +725,7 @@ pub const Engine = struct {
         for (sq.kv.layers[0..e.w.loaded_layers]) |ly| {
             switch (ly) {
                 .dsa => |d| {
-                    for ([_]u64{ d.mla_kv, d.idx_k }, [_]usize{ at * 576 * 2, at * 128 * 2 }) |src, n| {
+                    for ([_]u64{ d.mla_kv, d.idx_k, d.idx_k_sc }, [_]usize{ at * 576 * 2, at * 128, at * 4 }) |src, n| {
                         try e.copy(if (out) buf + off else src, if (out) src else buf + off, n);
                         off += n;
                     }

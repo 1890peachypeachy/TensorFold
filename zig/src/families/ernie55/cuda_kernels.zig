@@ -415,10 +415,10 @@ pub const Kernels = struct {
         try cuda.launch.launch(k.dsa_kv_norm_rope_store, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
     }
 
-    pub fn dsaIdxKStore(k: *const Kernels, s: Stream, k_idx: u64, positions: u64, idx_k: u64, rows: usize) !void {
+    pub fn dsaIdxKStore(k: *const Kernels, s: Stream, k_idx: u64, positions: u64, idx_k: u64, idx_k_sc: u64, rows: usize) !void {
         var a: cuda.Args = .{};
-        inline for (.{ k_idx, positions, idx_k, ci(rows) }) |v| a.add(v);
-        try cuda.launch.launch(k.dsa_idx_k_store, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, s, &a);
+        inline for (.{ k_idx, positions, idx_k, idx_k_sc, ci(rows) }) |v| a.add(v);
+        try cuda.launch.launch(k.dsa_idx_k_store, .{ .grid = .{ .x = cdiv(rows, 4) }, .block = .{ .x = 128 } }, s, &a);
     }
 
     pub fn dsaAbsorbQ(k: *const Kernels, s: Stream, q: u64, wk: u64, q_abs: u64, rows: usize, h_loc: usize) !void {
@@ -450,15 +450,15 @@ pub const Kernels = struct {
         try cuda.launch.launch(k.dsa_flashindexer_select, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, s, &a);
     }
 
-    pub fn dsaFlashindexerScoresFp8(k: *const Kernels, s: Stream, q_sel: u64, idx_k: u64, w_sel: u64, positions: u64, scores: u64, rows: usize, max_older: usize, window_size: usize) !void {
+    pub fn dsaFlashindexerScoresFp8(k: *const Kernels, s: Stream, q_sel: u64, idx_k: u64, idx_k_sc: u64, w_sel: u64, positions: u64, scores: u64, rows: usize, max_older: usize, window_size: usize) !void {
         var a: cuda.Args = .{};
-        inline for (.{ q_sel, idx_k, w_sel, positions, scores, ci(rows), ci(max_older), ci(window_size) }) |v| a.add(v);
+        inline for (.{ q_sel, idx_k, idx_k_sc, w_sel, positions, scores, ci(rows), ci(max_older), ci(window_size) }) |v| a.add(v);
         try cuda.launch.launch(k.dsa_flashindexer_scores_fp8_8h_mma, .{ .grid = .{ .x = cdiv(max_older, 64), .y = cdiv(rows, 8) }, .block = .{ .x = 128 } }, s, &a);
     }
 
-    pub fn dsaIndexerScoresMma(k: *const Kernels, s: Stream, q_idx: u64, idx_k: u64, weights: u64, positions: u64, scores: u64, rows: usize, max_older: usize, window: usize, w_scale: f32) !void {
+    pub fn dsaIndexerScoresMma(k: *const Kernels, s: Stream, q_idx: u64, idx_k: u64, idx_k_sc: u64, weights: u64, positions: u64, scores: u64, rows: usize, max_older: usize, window: usize, w_scale: f32) !void {
         var a: cuda.Args = .{};
-        inline for (.{ q_idx, idx_k, weights, positions, scores, ci(rows), ci(max_older), ci(window), w_scale }) |v| a.add(v);
+        inline for (.{ q_idx, idx_k, idx_k_sc, weights, positions, scores, ci(rows), ci(max_older), ci(window), w_scale }) |v| a.add(v);
         if (rows >= 4) {
             try cuda.launch.launch(k.dsa_indexer_scores_fp8_mma, .{ .grid = .{ .x = cdiv(max_older, 64), .y = cdiv(rows, 4) }, .block = .{ .x = 128 } }, s, &a);
             return;
