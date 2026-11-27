@@ -19,10 +19,10 @@ const gb10_window_costs = [_]lanes.allocate.Cost{
 
 /// Measured 4x DGX Spark (TP=4 RoCE, CUDA-graphed) shared verify costs by total rows (dense once, experts by rows).
 const gb10_shared_costs = [_]lanes.allocate.Cost{
-    .{ .width = 1, .ms = 36.0 },  .{ .width = 2, .ms = 40.0 },  .{ .width = 4, .ms = 45.0 },  .{ .width = 6, .ms = 49.0 },
-    .{ .width = 8, .ms = 53.0 },  .{ .width = 10, .ms = 57.0 }, .{ .width = 12, .ms = 61.0 }, .{ .width = 14, .ms = 65.0 },
-    .{ .width = 16, .ms = 69.0 }, .{ .width = 20, .ms = 77.0 }, .{ .width = 24, .ms = 85.0 }, .{ .width = 28, .ms = 93.0 },
-    .{ .width = 32, .ms = 101.0 },
+    .{ .width = 1, .ms = 36.0 },  .{ .width = 2, .ms = 40.0 },  .{ .width = 4, .ms = 44.0 },  .{ .width = 6, .ms = 48.0 },
+    .{ .width = 8, .ms = 51.0 },  .{ .width = 12, .ms = 56.0 }, .{ .width = 16, .ms = 60.0 }, .{ .width = 20, .ms = 64.0 },
+    .{ .width = 24, .ms = 67.0 }, .{ .width = 28, .ms = 71.0 }, .{ .width = 32, .ms = 75.0 }, .{ .width = 40, .ms = 83.0 },
+    .{ .width = 48, .ms = 91.0 }, .{ .width = 56, .ms = 99.0 }, .{ .width = 64, .ms = 107.0 },
 };
 
 const Lane = struct {

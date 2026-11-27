@@ -16,7 +16,7 @@ const KvCache = kv_mod.KvCache;
 const Scratch = kv_mod.Scratch;
 
 /// Rows from which the routed experts run expert-major on tensor cores (below: the per-pick kernels).
-pub const grouped_min_rows: usize = 128;
+pub const grouped_min_rows: usize = 24;
 /// Bytes from which a TP all-reduce is NCCL's ring (1.5x the shard on the wire) rather than the RoCE all-gather
 /// plus rank sum (3x at TP4, but one hop's latency): prompt chunks take the ring, decode windows the gather.
 pub const ring_min_bytes: usize = 1 << 20;
@@ -76,7 +76,7 @@ pub const Runner = struct {
                 return;
             }
         }
-        if (rows >= 64 and w.k % 128 == 0) {
+        if (rows >= 24 and w.k % 128 == 0) {
             if (self.w.fp8_raw.get(w.codes)) |raw| {
                 const q_bytes = ((rows * @as(usize, w.k)) + 255) & ~@as(usize, 255);
                 const xq = part;

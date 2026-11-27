@@ -13,7 +13,7 @@ const sampler = @import("cuda_sampler.zig");
 pub const prompt_rows: usize = 4096;
 /// Kept prompt states stand on this grid (chunks end early at a mark the cache asked for).
 pub const snap_grid: usize = 128;
-pub const window_rows: usize = 32;
+pub const window_rows: usize = 64;
 pub const max_slots: usize = 16;
 
 pub const Seq = struct {
@@ -302,7 +302,7 @@ pub const Engine = struct {
 
     /// Keep up to 2 warm sequence slots pooled across requests so sequential/c2 turns skip
     /// ~150 ms of cuMemAlloc + 4.3 GiB zero-fill and keep their captured CUDA graphs hot.
-    const pooled_slots: u32 = 2;
+    const pooled_slots: u32 = 4;
 
     pub fn release(e: *Engine, slot: u32) void {
         if (slot < e.seqs.items.len) {
