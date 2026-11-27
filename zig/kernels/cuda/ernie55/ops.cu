@@ -2239,3 +2239,38 @@ extern "C" __global__ void __launch_bounds__(128, 4) tf_ernie55_bf16_gemm_f32_mm
     float* __restrict__ Y, int M, int N, int K) {
     ernie_bf16_gemm_body<true>(X, W, Y, M, N, K);
 }
+
+struct TFSegEntry {
+    uint64_t stash_ptr;
+    int32_t row0;
+    int32_t n;
+    int32_t max_pos;
+    int32_t older_ceil;
+    int32_t sparse;
+    int32_t pad;
+};
+
+// Copy per-row DSpark taps to each segment's stash buffer.
+// Launch: grid=(rows, 4), block=(256)
+extern "C" __global__ void tf_ernie55_stash_taps_tab(
+    const __nv_bfloat16* __restrict__ taps,
+    const int32_t* __restrict__ row_seg,
+    const TFSegEntry* __restrict__ seg_tab,
+    int rows,
+    int tap_elems
+) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    int seg = row_seg[r];
+    if (seg < 0) return;
+    uint64_t dst_u64 = seg_tab[seg].stash_ptr;
+    if (dst_u64 == 0) return;
+    int local_r = r - seg_tab[seg].row0;
+    const uint4* src = reinterpret_cast<const uint4*>(taps + (int64_t)r * tap_elems);
+    uint4* dst = reinterpret_cast<uint4*>(reinterpret_cast<__nv_bfloat16*>(dst_u64) + (int64_t)local_r * tap_elems);
+    int vecs = tap_elems >> 3;
+    int chunk = (vecs + gridDim.y - 1) / gridDim.y;
+    int i0 = blockIdx.y * chunk;
+    int i1 = (i0 + chunk < vecs) ? (i0 + chunk) : vecs;
+    for (int i = i0 + threadIdx.x; i < i1; i += blockDim.x) dst[i] = src[i];
+}

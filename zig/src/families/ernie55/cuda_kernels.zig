@@ -72,6 +72,7 @@ pub const Kernels = struct {
     vha_u_proj_bf16: Function,
     vha_v_add_bf16: Function,
     mhc_pre_mma: Function,
+    stash_taps_tab: Function,
 
     // mxfp4_situ.cu
     mxfp4_w13_situ: Function,
@@ -106,6 +107,11 @@ pub const Kernels = struct {
     hca_attn_prefill_mma: Function,
     hca_attn_dspark_mma: Function,
     attn_splitk_combine: Function,
+    hca_qkv_prep_tab: Function,
+    hca_comp_save_packed_tab: Function,
+    hca_comp_flush_tab: Function,
+    hca_attn_mma_tab: Function,
+    attn_splitk_combine_tab: Function,
 
     // dsa_attn.cu
     dsa_kv_store: Function,
@@ -118,6 +124,11 @@ pub const Kernels = struct {
     dsa_attn: Function,
     dsa_qkv_prep: Function,
     dsa_attn_mma: Function,
+    dsa_qkv_prep_tab: Function,
+    dsa_idx_k_store_tab: Function,
+    dsa_indexer_scores_mma_tab: Function,
+    dsa_select_topk_tab: Function,
+    dsa_attn_mma_tab: Function,
 
     pub fn load(d: *const Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -136,12 +147,13 @@ pub const Kernels = struct {
         k.hca_mod = hca_mod;
         k.dsa_mod = dsa_mod;
 
+        @setEvalBranchQuota(10000);
         inline for (@typeInfo(Kernels).@"struct".field_names, @typeInfo(Kernels).@"struct".field_types) |name, T| {
             if (T == Function) {
                 const sym = "tf_ernie55_" ++ name;
                 const mod = if (comptime std.mem.startsWith(u8, name, "mxfp4_"))
                     mxfp4_mod
-                else if (comptime (std.mem.startsWith(u8, name, "hca_") and !std.mem.eql(u8, name, "hca_qnorm_rope") and !std.mem.eql(u8, name, "hca_qnorm_rope_split")) or std.mem.eql(u8, name, "attn_splitk_combine"))
+                else if (comptime (std.mem.startsWith(u8, name, "hca_") and !std.mem.eql(u8, name, "hca_qnorm_rope") and !std.mem.eql(u8, name, "hca_qnorm_rope_split")) or std.mem.startsWith(u8, name, "attn_splitk_combine"))
                     hca_mod
                 else if (comptime std.mem.startsWith(u8, name, "dsa_") and !std.mem.eql(u8, name, "dsa_qb_rope_split"))
                     dsa_mod
@@ -157,6 +169,8 @@ pub const Kernels = struct {
         try k.hca_attn_prefill_mma.allowDynamicShared(92 * 1024);
         try k.hca_attn_dspark_mma.allowDynamicShared(54 * 1024);
         try k.dsa_attn_mma.allowDynamicShared(60 * 1024);
+        try k.hca_attn_mma_tab.allowDynamicShared(54 * 1024);
+        try k.dsa_attn_mma_tab.allowDynamicShared(60 * 1024);
         return k;
     }
 
@@ -680,5 +694,73 @@ pub const Kernels = struct {
         var a: cuda.Args = .{};
         inline for (.{ x, w, y, ci(m), ci(n), ci(k_dim) }) |v| a.add(v);
         try cuda.launch.launch(k.bf16_gemm_f32_mma, .{ .grid = .{ .x = cdiv(n, 64), .y = cdiv(m, 64) }, .block = .{ .x = 128 } }, s, &a);
+    }
+
+    pub fn stashTapsTab(k: *const Kernels, s: Stream, taps: u64, row_seg: u64, seg_tab: u64, rows: usize, tap_elems: usize) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ taps, row_seg, seg_tab, ci(rows), ci(tap_elems) }) |v| a.add(v);
+        try cuda.launch.launch(k.stash_taps_tab, .{ .grid = .{ .x = @intCast(rows), .y = 4 }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn hcaQkvPrepTab(k: *const Kernels, s: Stream, packed_in: u64, q_norm: u64, kv_norm: u64, positions: u64, inv_freq: u64, q_down: u64, row_seg: u64, kv_ptrs: u64, layer_off: usize, rows: usize, swa_mask: usize, eps: f32) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ packed_in, q_norm, kv_norm, positions, inv_freq, q_down, row_seg, kv_ptrs, ci(layer_off), ci(rows), ci(swa_mask), eps }) |v| a.add(v);
+        try cuda.launch.launch(k.hca_qkv_prep_tab, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn hcaCompSavePackedTab(k: *const Kernels, s: Stream, packed_in: u64, ape: u64, positions: u64, row_seg: u64, kv_ptrs: u64, layer_off: usize, rows: usize, state_mask: usize) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ packed_in, ape, positions, row_seg, kv_ptrs, ci(layer_off), ci(rows), ci(state_mask) }) |v| a.add(v);
+        try cuda.launch.launch(k.hca_comp_save_packed_tab, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn hcaCompFlushTab(k: *const Kernels, s: Stream, norm_w: u64, positions: u64, inv_freq: u64, row_seg: u64, kv_ptrs: u64, layer_off: usize, rows: usize, state_mask: usize, eps: f32) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ norm_w, positions, inv_freq, row_seg, kv_ptrs, ci(layer_off), ci(rows), ci(state_mask), eps }) |v| a.add(v);
+        try cuda.launch.launch(k.hca_comp_flush_tab, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn hcaAttnMmaTab(k: *const Kernels, s: Stream, q: u64, sink: u64, positions: u64, out: u64, opart: u64, mpart: u64, lpart: u64, row_seg: u64, seg_tab: u64, kv_ptrs: u64, layer_off: usize, has_comp: bool, rows: usize, swa_mask: usize, window_size: usize, max_sp: usize, scale: f32) !void {
+        const smem: u32 = (16 * 520 + 32 * 520) * 2 + 16 * 32 * 4 + 16 * 32 * 2 + 192;
+        var a: cuda.Args = .{};
+        inline for (.{ q, sink, positions, out, opart, mpart, lpart, row_seg, seg_tab, kv_ptrs, ci(layer_off), @as(c_int, @intFromBool(has_comp)), ci(rows), ci(swa_mask), ci(window_size), ci(max_sp), scale }) |v| a.add(v);
+        try cuda.launch.launch(k.hca_attn_mma_tab, .{ .grid = .{ .x = @intCast(max_sp), .y = @intCast(rows) }, .block = .{ .x = 128 }, .shared = smem }, s, &a);
+        var ac: cuda.Args = .{};
+        inline for (.{ opart, mpart, lpart, out, row_seg, seg_tab, ci(rows), ci(max_sp), ci(max_sp) }) |v| ac.add(v);
+        try cuda.launch.launch(k.attn_splitk_combine_tab, .{ .grid = .{ .x = 16, .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &ac);
+    }
+
+    pub fn dsaQkvPrepTab(k: *const Kernels, s: Stream, packed_in: u64, q_a_norm: u64, kv_a_norm: u64, positions: u64, inv_freq: u64, q_down: u64, row_seg: u64, kv_ptrs: u64, layer_off: usize, rows: usize, eps: f32) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ packed_in, q_a_norm, kv_a_norm, positions, inv_freq, q_down, row_seg, kv_ptrs, ci(layer_off), ci(rows), eps }) |v| a.add(v);
+        try cuda.launch.launch(k.dsa_qkv_prep_tab, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn dsaIdxKStoreTab(k: *const Kernels, s: Stream, k_idx: u64, positions: u64, row_seg: u64, kv_ptrs: u64, layer_off: usize, rows: usize) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ k_idx, positions, row_seg, kv_ptrs, ci(layer_off), ci(rows) }) |v| a.add(v);
+        try cuda.launch.launch(k.dsa_idx_k_store_tab, .{ .grid = .{ .x = cdiv(rows, 4) }, .block = .{ .x = 128 } }, s, &a);
+    }
+
+    pub fn dsaIndexerScoresMmaTab(k: *const Kernels, s: Stream, q_idx: u64, weights: u64, positions: u64, scores: u64, row_seg: u64, seg_tab: u64, kv_ptrs: u64, layer_off: usize, rows: usize, max_older: usize, window: usize, w_scale: f32) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ q_idx, weights, positions, scores, row_seg, seg_tab, kv_ptrs, ci(layer_off), ci(rows), ci(max_older), ci(window), w_scale }) |v| a.add(v);
+        try cuda.launch.launch(k.dsa_indexer_scores_mma_tab, .{ .grid = .{ .x = cdiv(max_older, 64), .y = @intCast(rows) }, .block = .{ .x = 128 }, .shared = 128 * 136 * 2 + 4 * 64 * 4 }, s, &a);
+    }
+
+    pub fn dsaSelectTopkTab(k: *const Kernels, s: Stream, scores: u64, positions: u64, out_idx: u64, out_cnt: u64, row_seg: u64, seg_tab: u64, rows: usize, max_older: usize, topk: usize, window: usize) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ scores, positions, out_idx, out_cnt, row_seg, seg_tab, ci(rows), ci(max_older), ci(topk), ci(window) }) |v| a.add(v);
+        try cuda.launch.launch(k.dsa_select_topk_tab, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn dsaAttnMmaTab(k: *const Kernels, s: Stream, q_abs: u64, indices: u64, counts: u64, sinks: u64, positions: u64, out_lat: u64, opart: u64, mpart: u64, lpart: u64, row_seg: u64, seg_tab: u64, kv_ptrs: u64, layer_off: usize, rows: usize, idx_stride: usize, max_sp: usize, scale: f32) !void {
+        const smem: u32 = (16 * 584 + 32 * 584) * 2 + 16 * 32 * 4 + 16 * 32 * 2 + 192;
+        var a: cuda.Args = .{};
+        inline for (.{ q_abs, indices, counts, sinks, positions, out_lat, opart, mpart, lpart, row_seg, seg_tab, kv_ptrs, ci(layer_off), ci(rows), ci(idx_stride), ci(max_sp), scale }) |v| a.add(v);
+        try cuda.launch.launch(k.dsa_attn_mma_tab, .{ .grid = .{ .x = @intCast(max_sp), .y = @intCast(rows) }, .block = .{ .x = 128 }, .shared = smem }, s, &a);
+        var ac: cuda.Args = .{};
+        inline for (.{ opart, mpart, lpart, out_lat, row_seg, seg_tab, ci(rows), ci(max_sp), ci(max_sp) }) |v| ac.add(v);
+        try cuda.launch.launch(k.attn_splitk_combine_tab, .{ .grid = .{ .x = 16, .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &ac);
     }
 };

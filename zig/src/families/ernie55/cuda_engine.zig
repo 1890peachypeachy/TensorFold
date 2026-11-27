@@ -73,11 +73,16 @@ pub const BlockPart = struct { slot: u32, kept_n: usize, anchor: u32, out: []u32
 pub const max_parts: usize = 8;
 
 const SharedVerifyKey = struct {
-    np: u8 = 0,
-    slots: [max_parts]u8 = @splat(0),
-    ns: [max_parts]u8 = @splat(0),
-    buckets: [max_parts]u32 = @splat(0),
+    bucket_rows: u16 = 0,
+    any_sparse: bool = false,
+    older_ceil: u32 = 0,
 };
+
+fn bucketFor(rows: usize) usize {
+    const buckets = [_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64 };
+    for (buckets) |b| if (rows <= b) return b;
+    return window_rows;
+}
 
 const SharedVerifyEntry = struct {
     key: SharedVerifyKey = .{},
@@ -91,7 +96,7 @@ const SharedVerifyEntry = struct {
             self.graph = null;
         }
         self.warmed = false;
-        self.key.np = 0;
+        self.key = .{};
     }
 };
 
@@ -145,7 +150,7 @@ pub const Engine = struct {
     snaps: std.AutoHashMapUnmanaged(u64, Snap) = .empty,
     next_snap: u64 = 1,
     dropped: std.ArrayList(u32) = .empty, // ids rank 0 freed, sent to the other ranks with the next step
-    shared_verify_graphs: [8]SharedVerifyEntry = @splat(.{}),
+    shared_verify_graphs: [32]SharedVerifyEntry = @splat(.{}),
     shared_draft_graphs: [8]SharedDraftEntry = @splat(.{}),
     graph_tick: u64 = 0,
 
@@ -284,13 +289,6 @@ pub const Engine = struct {
     }
 
     fn invalidateSharedSlot(e: *Engine, slot: u32) void {
-        for (&e.shared_verify_graphs) |*ent| {
-            if (ent.key.np == 0) continue;
-            for (0..ent.key.np) |i| if (ent.key.slots[i] == slot) {
-                ent.clear();
-                break;
-            };
-        }
         for (&e.shared_draft_graphs) |*ent| {
             if (ent.key.np == 0) continue;
             for (0..ent.key.np) |i| if (ent.key.slots[i] == slot) {
@@ -504,13 +502,18 @@ pub const Engine = struct {
     /// Like verify(), positions do not advance; each stream's keep() follows.
     pub fn verifyMany(e: *Engine, parts: []const Part) !void {
         if (parts.len == 0 or parts.len > max_parts) return error.BadParts;
-        var ids_i32: [window_rows]i32 = undefined;
-        var pos_i32: [window_rows]i32 = undefined;
+        var ids_i32: [window_rows]i32 = @splat(0);
+        var pos_i32: [window_rows]i32 = @splat(0);
+        var row_seg_i32: [window_rows]i32 = @splat(-1);
         var segs: [max_parts]fw.Seg = undefined;
+        var seg_tab_arr: [max_parts]kv_mod.SegEntry = undefined;
+        var kv_ptrs_arr: [max_parts * 64 * 3]u64 = undefined;
         var seqs: [max_parts]*Seq = undefined;
-        var key: SharedVerifyKey = .{ .np = @intCast(parts.len) };
         var rows: usize = 0;
+        var any_sparse = false;
+        var max_older: usize = 0;
         var greedy = true;
+        const n_layers = e.w.loaded_layers;
         for (parts, 0..) |pt, i| {
             if (pt.slot >= e.seqs.items.len) return error.NoSequence;
             const sq = e.seqs.items[pt.slot] orelse return error.NoSequence;
@@ -519,30 +522,59 @@ pub const Engine = struct {
             for (0..n) |j| {
                 ids_i32[rows + j] = @intCast(pt.ids[j]);
                 pos_i32[rows + j] = @intCast(sq.kv.pos + j);
+                row_seg_i32[rows + j] = @intCast(i);
             }
             const mp = sq.kv.pos + n - 1;
             var bucket: usize = 0;
-            if (mp + 1 > 2176) {
+            const sparse = (mp + 1 > 2176);
+            if (sparse) {
                 const need = mp + 1 - e.w.config.sliding_window;
                 bucket = 4096;
                 while (bucket < need and bucket < e.capacity) bucket *= 2;
                 bucket = @min(bucket, e.capacity);
+                any_sparse = true;
+                max_older = @max(max_older, bucket);
             }
             segs[i] = .{ .kv = &sq.kv, .row0 = rows, .n = n, .max_pos = mp, .older_ceil = bucket };
+            seg_tab_arr[i] = .{
+                .stash_ptr = if (sq.stash) |st| st.ptr else 0,
+                .row0 = @intCast(rows),
+                .n = @intCast(n),
+                .max_pos = @intCast(mp),
+                .older_ceil = @intCast(bucket),
+                .sparse = if (sparse) 1 else 0,
+            };
+            const base = i * n_layers * 3;
+            for (0..n_layers) |li| {
+                switch (sq.kv.layers[li]) {
+                    .hca => |h| {
+                        kv_ptrs_arr[base + li * 3 + 0] = h.swa_kv;
+                        kv_ptrs_arr[base + li * 3 + 1] = h.comp_state;
+                        kv_ptrs_arr[base + li * 3 + 2] = h.comp_kv;
+                    },
+                    .dsa => |d| {
+                        kv_ptrs_arr[base + li * 3 + 0] = d.mla_kv;
+                        kv_ptrs_arr[base + li * 3 + 1] = d.idx_k;
+                        kv_ptrs_arr[base + li * 3 + 2] = d.idx_k_sc;
+                    },
+                }
+            }
             seqs[i] = sq;
-            key.slots[i] = @intCast(pt.slot);
-            key.ns[i] = @intCast(n);
-            key.buckets[i] = @intCast(bucket);
             if (sq.sampling != null) greedy = false;
             rows += n;
         }
-        try e.sc_dec.buf.upload(e.sc_dec.ids - e.sc_dec.buf.ptr, std.mem.sliceAsBytes(ids_i32[0..rows]));
-        try e.sc_dec.buf.upload(e.sc_dec.positions - e.sc_dec.buf.ptr, std.mem.sliceAsBytes(pos_i32[0..rows]));
+        const bucket_rows = bucketFor(rows);
+        try e.sc_dec.buf.upload(e.sc_dec.ids - e.sc_dec.buf.ptr, std.mem.sliceAsBytes(ids_i32[0..bucket_rows]));
+        try e.sc_dec.buf.upload(e.sc_dec.positions - e.sc_dec.buf.ptr, std.mem.sliceAsBytes(pos_i32[0..bucket_rows]));
+        try e.sc_dec.buf.upload(e.sc_dec.row_seg - e.sc_dec.buf.ptr, std.mem.sliceAsBytes(row_seg_i32[0..bucket_rows]));
+        try e.sc_dec.buf.upload(e.sc_dec.seg_tab - e.sc_dec.buf.ptr, std.mem.sliceAsBytes(seg_tab_arr[0..parts.len]));
+        try e.sc_dec.buf.upload(e.sc_dec.kv_ptrs - e.sc_dec.buf.ptr, std.mem.sliceAsBytes(kv_ptrs_arr[0 .. parts.len * n_layers * 3]));
 
+        const key: SharedVerifyKey = .{ .bucket_rows = @intCast(bucket_rows), .any_sparse = any_sparse, .older_ceil = @intCast(max_older) };
         const taps_out: u64 = if (e.drafter != null) e.sc_dec.dspark_taps else 0;
+        const tap_elems = 3 * e.w.config.hidden;
         const r = e.runner();
-        const tap_row = 3 * e.w.config.hidden * 2;
-        const can_graph = (e.group == null or e.group.?.fast != null);
+        const can_graph = (e.group == null or e.group.?.fast != null) and e.w.share.heads == 16;
 
         if (can_graph) {
             e.graph_tick += 1;
@@ -554,7 +586,7 @@ pub const Engine = struct {
                     slot_idx = ei;
                     break;
                 }
-                if (ent.key.np == 0) {
+                if (ent.key.bucket_rows == 0) {
                     lru_idx = ei;
                     lru_tick = 0;
                 } else if (ent.tick < lru_tick) {
@@ -571,17 +603,13 @@ pub const Engine = struct {
             if (ent.graph) |ge| {
                 try ge.launchOn(e.stream);
             } else if (!ent.warmed) {
-                try r.forwardSegs(e.stream, segs[0..parts.len], &e.sc_dec, rows, true, taps_out);
-                for (0..parts.len) |i| {
-                    if (seqs[i].stash) |st| try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(st.ptr, e.sc_dec.dspark_taps + segs[i].row0 * tap_row, segs[i].n * tap_row, e.stream.handle), "cuMemcpyDtoDAsync");
-                }
+                try r.forwardSegsTab(e.stream, any_sparse, max_older, &e.sc_dec, bucket_rows, taps_out);
+                if (taps_out != 0) try e.k.stashTapsTab(e.stream, taps_out, e.sc_dec.row_seg, e.sc_dec.seg_tab, bucket_rows, tap_elems);
                 ent.warmed = true;
             } else {
                 try cuda.graph.beginCapture(e.stream, .thread_local);
-                try r.forwardSegs(e.stream, segs[0..parts.len], &e.sc_dec, rows, true, taps_out);
-                for (0..parts.len) |i| {
-                    if (seqs[i].stash) |st| try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(st.ptr, e.sc_dec.dspark_taps + segs[i].row0 * tap_row, segs[i].n * tap_row, e.stream.handle), "cuMemcpyDtoDAsync");
-                }
+                try r.forwardSegsTab(e.stream, any_sparse, max_older, &e.sc_dec, bucket_rows, taps_out);
+                if (taps_out != 0) try e.k.stashTapsTab(e.stream, taps_out, e.sc_dec.row_seg, e.sc_dec.seg_tab, bucket_rows, tap_elems);
                 var g = try cuda.graph.endCapture(e.stream);
                 defer g.deinit();
                 ent.graph = try g.instantiate();
@@ -589,9 +617,7 @@ pub const Engine = struct {
             }
         } else {
             try r.forwardSegs(e.stream, segs[0..parts.len], &e.sc_dec, rows, true, taps_out);
-            for (0..parts.len) |i| {
-                if (seqs[i].stash) |st| try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(st.ptr, e.sc_dec.dspark_taps + segs[i].row0 * tap_row, segs[i].n * tap_row, e.stream.handle), "cuMemcpyDtoDAsync");
-            }
+            if (taps_out != 0) try e.k.stashTapsTab(e.stream, taps_out, e.sc_dec.row_seg, e.sc_dec.seg_tab, bucket_rows, tap_elems);
         }
 
         if (greedy) {

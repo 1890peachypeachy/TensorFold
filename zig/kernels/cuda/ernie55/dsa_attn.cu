@@ -35,6 +35,16 @@ __device__ __forceinline__ float warp_allreduce_sum(float v) {
 
 // Store normed kv_c [rows, 512] + roped k_pe [rows, 64] into mla_kv[positions[r], 0..575]
 // Launch: grid=(rows), block=(256)
+struct TFDsaSegEntry {
+    uint64_t stash_ptr;
+    int32_t row0;
+    int32_t n;
+    int32_t max_pos;
+    int32_t older_ceil;
+    int32_t sparse;
+    int32_t pad;
+};
+
 extern "C" __global__ void tf_ernie55_dsa_kv_store(
     const __nv_bfloat16* __restrict__ kv_c,  // [rows, 512]
     const __nv_bfloat16* __restrict__ k_pe,  // [rows, 64] (already GPT-J roped)
@@ -204,19 +214,17 @@ extern "C" __global__ void tf_ernie55_dsa_indexer_scores(
 // Fast radix-threshold top-k selection for Lightning Indexer (selects top `topk` from `n_older`, appends SWA window).
 // Uses parallel 256-bin float-key histogram in shared memory (O(n_older) in ~15 us even at 200K context!).
 // Launch: grid=(rows), block=(256)
-extern "C" __global__ void tf_ernie55_dsa_select_topk(
-    const float* __restrict__ scores,      // [rows, max_older]
-    const int32_t* __restrict__ positions, // [rows]
-    int32_t* __restrict__ out_indices,     // [rows, topk + window_size]
-    int32_t* __restrict__ out_counts,      // [rows]
-    int rows,
+__device__ __forceinline__ void dsa_select_topk_impl(
+    const float* __restrict__ scores,
+    const int32_t* __restrict__ positions,
+    int32_t* __restrict__ out_indices,
+    int32_t* __restrict__ out_counts,
+    int r,
     int max_older,
     int topk,
     int window_size
 ) {
-    int r = blockIdx.x;
     int tid = threadIdx.x;
-    if (r >= rows) return;
 
     int pos = positions[r];
     int width = topk + window_size;
@@ -318,6 +326,40 @@ extern "C" __global__ void tf_ernie55_dsa_select_topk(
 //
 // Each CTA has 256 threads = 8 warps, 2 heads per warp = 16 heads per CTA!
 // Lane 0..31 owns 16 latent dims (d = lane*16..lane*16+15) + 2 rope dims (r = lane*2, lane*2+1)!
+
+extern "C" __global__ void tf_ernie55_dsa_select_topk(
+    const float* __restrict__ scores,
+    const int32_t* __restrict__ positions,
+    int32_t* __restrict__ out_indices,
+    int32_t* __restrict__ out_counts,
+    int rows,
+    int max_older,
+    int topk,
+    int window_size
+) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    dsa_select_topk_impl(scores, positions, out_indices, out_counts, r, max_older, topk, window_size);
+}
+
+extern "C" __global__ void tf_ernie55_dsa_select_topk_tab(
+    const float* __restrict__ scores,
+    const int32_t* __restrict__ positions,
+    int32_t* __restrict__ out_indices,
+    int32_t* __restrict__ out_counts,
+    const int32_t* __restrict__ row_seg,
+    const TFDsaSegEntry* __restrict__ seg_tab,
+    int rows,
+    int max_older,
+    int topk,
+    int window_size
+) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    int seg = row_seg[r];
+    if (seg < 0 || seg_tab[seg].sparse == 0) return;
+    dsa_select_topk_impl(scores, positions, out_indices, out_counts, r, max_older, topk, window_size);
+}
 // Launch: grid=(ceil(H_loc / 16), rows), block=(256)
 extern "C" __global__ void tf_ernie55_dsa_attn(
     const __nv_bfloat16* __restrict__ q_abs,
@@ -772,25 +814,28 @@ extern "C" __global__ void tf_ernie55_dsa_qkv_prep(
 
 // SM121a Tensor-Core FlashAttention + Split-K for MLA-DSA (H_loc=16, D_QK=576, D_V=512, LD=584)
 // Launch: grid=(splits, rows), block=(128), smem=59328
-extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_attn_mma(
-    const __nv_bfloat16* __restrict__ q_abs,   // [rows, 16, 576]
-    const __nv_bfloat16* __restrict__ mla_kv,  // [capacity, 576]
-    const int32_t* __restrict__ indices,       // nullable [rows, idx_stride]
-    const int32_t* __restrict__ counts,        // nullable [rows]
-    const float* __restrict__ sinks,           // [16]
-    const int32_t* __restrict__ positions,     // [rows]
-    __nv_bfloat16* __restrict__ out_lat,       // [rows, 16, 512] (written when splits == 1)
-    float* __restrict__ opart,                 // [rows, splits, 16, 512] (written when splits > 1)
-    float* __restrict__ mpart,                 // [rows, splits, 16]
-    float* __restrict__ lpart,                 // [rows, splits, 16]
-    int rows,
+__device__ __forceinline__ int tf_dsa_attn_splits(int n, int max_sp) {
+    return (n > 16) ? 1 : (n <= 4) ? max_sp : (n <= 8) ? 6 : 2;
+}
+
+__device__ __forceinline__ void dsa_attn_mma_impl(
+    const __nv_bfloat16* __restrict__ q_abs,
+    const __nv_bfloat16* __restrict__ mla_kv,
+    const int32_t* __restrict__ indices,
+    const int32_t* __restrict__ counts,
+    const float* __restrict__ sinks,
+    const int32_t* __restrict__ positions,
+    __nv_bfloat16* __restrict__ out_lat,
+    float* __restrict__ opart,
+    float* __restrict__ mpart,
+    float* __restrict__ lpart,
+    int r,
+    int sp,
     int idx_stride,
     int splits,
+    int split_stride,
     float scale
 ) {
-    int r = blockIdx.y;
-    int sp = blockIdx.x;
-    if (r >= rows) return;
 
     int pos = positions[r];
     bool use_idx = (indices != nullptr && counts != nullptr);
@@ -802,8 +847,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_attn_mma(
     int k_end = (k_start + chunk < total_k) ? (k_start + chunk) : total_k;
 
     constexpr int LD = 584;
-    extern __shared__ unsigned char raw[];
-    __nv_bfloat16* s_q = reinterpret_cast<__nv_bfloat16*>(raw);
+    extern __shared__ unsigned char raw_dsa_mma[];
+    __nv_bfloat16* s_q = reinterpret_cast<__nv_bfloat16*>(raw_dsa_mma);
     __nv_bfloat16* s_k = s_q + 16 * LD;
     float* s_sc = reinterpret_cast<float*>(s_k + 32 * LD);
     __nv_bfloat16* s_p = reinterpret_cast<__nv_bfloat16*>(s_sc + 16 * 32);
@@ -939,11 +984,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_attn_mma(
         }
     } else {
         if (tid < 16) {
-            mpart[((int64_t)r * splits + sp) * 16 + tid] = s_m[tid];
-            lpart[((int64_t)r * splits + sp) * 16 + tid] = s_l[tid];
+            mpart[((int64_t)r * split_stride + sp) * 16 + tid] = s_m[tid];
+            lpart[((int64_t)r * split_stride + sp) * 16 + tid] = s_l[tid];
         }
-        float* o0 = opart + (((int64_t)r * splits + sp) * 16 + g) * 512;
-        float* o1 = opart + (((int64_t)r * splits + sp) * 16 + g + 8) * 512;
+        float* o0 = opart + (((int64_t)r * split_stride + sp) * 16 + g) * 512;
+        float* o1 = opart + (((int64_t)r * split_stride + sp) * 16 + g + 8) * 512;
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
             int dn = d_warp + j * 8 + tq * 2;
@@ -956,6 +1001,60 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_attn_mma(
 }
 
 
+
+extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_attn_mma(
+    const __nv_bfloat16* __restrict__ q_abs,
+    const __nv_bfloat16* __restrict__ mla_kv,
+    const int32_t* __restrict__ indices,
+    const int32_t* __restrict__ counts,
+    const float* __restrict__ sinks,
+    const int32_t* __restrict__ positions,
+    __nv_bfloat16* __restrict__ out_lat,
+    float* __restrict__ opart,
+    float* __restrict__ mpart,
+    float* __restrict__ lpart,
+    int rows,
+    int idx_stride,
+    int splits,
+    float scale
+) {
+    int r = blockIdx.y;
+    int sp = blockIdx.x;
+    if (r >= rows) return;
+    dsa_attn_mma_impl(q_abs, mla_kv, indices, counts, sinks, positions, out_lat, opart, mpart, lpart, r, sp, idx_stride, splits, splits, scale);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_attn_mma_tab(
+    const __nv_bfloat16* __restrict__ q_abs,
+    const int32_t* __restrict__ indices,
+    const int32_t* __restrict__ counts,
+    const float* __restrict__ sinks,
+    const int32_t* __restrict__ positions,
+    __nv_bfloat16* __restrict__ out_lat,
+    float* __restrict__ opart,
+    float* __restrict__ mpart,
+    float* __restrict__ lpart,
+    const int32_t* __restrict__ row_seg,
+    const TFDsaSegEntry* __restrict__ seg_tab,
+    const uint64_t* __restrict__ kv_ptrs,
+    int layer_off,
+    int rows,
+    int idx_stride,
+    int max_sp,
+    float scale
+) {
+    int r = blockIdx.y;
+    int sp = blockIdx.x;
+    if (r >= rows) return;
+    int seg = row_seg[r];
+    if (seg < 0) return;
+    int splits = tf_dsa_attn_splits(seg_tab[seg].n, max_sp);
+    if (sp >= splits) return;
+    const __nv_bfloat16* mla_kv = reinterpret_cast<const __nv_bfloat16*>(kv_ptrs[seg * layer_off + 0]);
+    const int32_t* idx_ptr = seg_tab[seg].sparse ? indices : nullptr;
+    const int32_t* cnt_ptr = seg_tab[seg].sparse ? counts : nullptr;
+    dsa_attn_mma_impl(q_abs, mla_kv, idx_ptr, cnt_ptr, sinks, positions, out_lat, opart, mpart, lpart, r, sp, idx_stride, splits, max_sp, scale);
+}
 // 4-row-tiled SM121a FP8 m16n8k32 DSA Lightning Indexer for prefill (rows >= 4):
 // Loads ks[64, 128] ONCE per 4 query rows (4x less DRAM traffic on idx_k at 70K+ context!)
 // and runs mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 (2x Tensor Core throughput!).
@@ -1301,5 +1400,182 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_flashindexer_sc
                 if (t0 + c1 < max_older) scores[(int64_t)(r0 + dr1) * max_older + t0 + c1] = (t0 + c1 < no1) ? v11 : -1e38f;
             }
         }
+    }
+}
+
+extern "C" __global__ void tf_ernie55_dsa_qkv_prep_tab(
+    const __nv_bfloat16* __restrict__ packed,
+    const __nv_bfloat16* __restrict__ q_a_norm,
+    const __nv_bfloat16* __restrict__ kv_a_norm,
+    const int32_t* __restrict__ positions,
+    const float* __restrict__ inv_freq,
+    __nv_bfloat16* __restrict__ q_down,
+    const int32_t* __restrict__ row_seg,
+    const uint64_t* __restrict__ kv_ptrs,
+    int layer_off,
+    int rows,
+    float eps
+) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    int seg = row_seg[r];
+    if (seg < 0) return;
+    __nv_bfloat16* mla_kv = reinterpret_cast<__nv_bfloat16*>(kv_ptrs[seg * layer_off + 0]);
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    __shared__ float s_red[8];
+    const __nv_bfloat16* src = packed + (int64_t)r * 1600;
+    float q0 = bf2f(src[tid]), q1 = bf2f(src[tid + 256]), q2 = bf2f(src[tid + 512]), q3 = bf2f(src[tid + 768]);
+    float qsq = warp_sum(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    if (lane == 0) s_red[warp] = qsq;
+    __syncthreads();
+    if (warp == 0) { float t = (lane < 8) ? s_red[lane] : 0.0f; t = warp_sum(t); if (lane == 0) s_red[0] = rsqrtf(t / 1024.0f + eps); }
+    __syncthreads();
+    float q_rrms = s_red[0];
+    __nv_bfloat16* qdst = q_down + (int64_t)r * 1024;
+    qdst[tid] = f2bf(q0 * q_rrms * bf2f(q_a_norm[tid]));
+    qdst[tid + 256] = f2bf(q1 * q_rrms * bf2f(q_a_norm[tid + 256]));
+    qdst[tid + 512] = f2bf(q2 * q_rrms * bf2f(q_a_norm[tid + 512]));
+    qdst[tid + 768] = f2bf(q3 * q_rrms * bf2f(q_a_norm[tid + 768]));
+
+    const __nv_bfloat16* ksrc = src + 1024;
+    float k0 = bf2f(ksrc[tid * 2]), k1 = bf2f(ksrc[tid * 2 + 1]);
+    float ksq = warp_sum(k0 * k0 + k1 * k1);
+    __syncthreads();
+    if (lane == 0) s_red[warp] = ksq;
+    __syncthreads();
+    if (warp == 0) { float t = (lane < 8) ? s_red[lane] : 0.0f; t = warp_sum(t); if (lane == 0) s_red[0] = rsqrtf(t / 512.0f + eps); }
+    __syncthreads();
+    float k_rrms = s_red[0];
+    int pos = positions[r];
+    __nv_bfloat16* kdst = mla_kv + (int64_t)pos * 576;
+    kdst[tid * 2] = f2bf(k0 * k_rrms * bf2f(kv_a_norm[tid * 2]));
+    kdst[tid * 2 + 1] = f2bf(k1 * k_rrms * bf2f(kv_a_norm[tid * 2 + 1]));
+    if (tid < 32) {
+        float e = bf2f(ksrc[512 + tid * 2]), o = bf2f(ksrc[512 + tid * 2 + 1]), c, sv;
+        __sincosf((float)pos * inv_freq[tid], &sv, &c);
+        kdst[512 + tid * 2] = f2bf(e * c - o * sv);
+        kdst[512 + tid * 2 + 1] = f2bf(o * c + e * sv);
+    }
+}
+
+extern "C" __global__ void tf_ernie55_dsa_idx_k_store_tab(
+    const __nv_bfloat16* __restrict__ k_idx,
+    const int32_t* __restrict__ positions,
+    const int32_t* __restrict__ row_seg,
+    const uint64_t* __restrict__ kv_ptrs,
+    int layer_off,
+    int rows
+) {
+    int r = blockIdx.x * 4 + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    if (r >= rows) return;
+    int seg = row_seg[r];
+    if (seg < 0) return;
+    uint8_t* idx_k = reinterpret_cast<uint8_t*>(kv_ptrs[seg * layer_off + 1]);
+    float* idx_k_sc = reinterpret_cast<float*>(kv_ptrs[seg * layer_off + 2]);
+    uint2 raw = *reinterpret_cast<const uint2*>(k_idx + (int64_t)r * 128 + lane * 4);
+    const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    float v0 = __bfloat162float(b[0]), v1 = __bfloat162float(b[1]), v2 = __bfloat162float(b[2]), v3 = __bfloat162float(b[3]);
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    float sc = fmaxf(amax, 1e-12f) * (1.0f / 448.0f), inv = 1.0f / sc;
+    int pos = positions[r];
+    if (lane == 0) idx_k_sc[pos] = sc;
+    uint8_t q0 = __nv_fp8_e4m3(v0 * inv).__x, q1 = __nv_fp8_e4m3(v1 * inv).__x;
+    uint8_t q2 = __nv_fp8_e4m3(v2 * inv).__x, q3 = __nv_fp8_e4m3(v3 * inv).__x;
+    uint32_t packed = (uint32_t)q0 | ((uint32_t)q1 << 8) | ((uint32_t)q2 << 16) | ((uint32_t)q3 << 24);
+    *reinterpret_cast<uint32_t*>(idx_k + (int64_t)pos * 128 + lane * 4) = packed;
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_indexer_scores_mma_tab(
+    const __nv_bfloat16* __restrict__ q_idx,
+    const __nv_bfloat16* __restrict__ weights,
+    const int32_t* __restrict__ positions,
+    float* __restrict__ scores,
+    const int32_t* __restrict__ row_seg,
+    const TFDsaSegEntry* __restrict__ seg_tab,
+    const uint64_t* __restrict__ kv_ptrs,
+    int layer_off,
+    int rows,
+    int max_older,
+    int window_size,
+    float weights_scale
+) {
+    const int r = blockIdx.y;
+    const int t0 = blockIdx.x * 64;
+    if (r >= rows || t0 >= max_older) return;
+    const int seg = row_seg[r];
+    if (seg < 0 || seg_tab[seg].sparse == 0) return;
+    const int n_older = positions[r] - window_size + 1;
+    if (t0 >= n_older) {
+        for (int i = threadIdx.x; i < 64; i += blockDim.x)
+            if (t0 + i < max_older) scores[(int64_t)r * max_older + t0 + i] = -1e38f;
+        return;
+    }
+    const uint8_t* idx_k = reinterpret_cast<const uint8_t*>(kv_ptrs[seg * layer_off + 1]);
+    const float* idx_k_sc = reinterpret_cast<const float*>(kv_ptrs[seg * layer_off + 2]);
+    extern __shared__ __align__(16) __nv_bfloat16 sm[];
+    __nv_bfloat16* qs = sm;
+    __nv_bfloat16* ks = qs + 64 * TF_IDX_LD;
+    float* red = reinterpret_cast<float*>(ks + 64 * TF_IDX_LD);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
+    const __nv_bfloat16* qr = q_idx + (int64_t)r * 64 * 128;
+    for (int i = threadIdx.x; i < 64 * 16; i += blockDim.x) {
+        const int row = i >> 4, c = (i & 15) * 8;
+        *reinterpret_cast<uint4*>(qs + row * TF_IDX_LD + c) = *reinterpret_cast<const uint4*>(qr + row * 128 + c);
+        const int t = t0 + row;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (t < n_older) {
+            uint2 raw = *reinterpret_cast<const uint2*>(idx_k + (int64_t)t * 128 + c);
+            const float sc = idx_k_sc[t];
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&raw);
+            __nv_bfloat16* out_bf = reinterpret_cast<__nv_bfloat16*>(&v);
+            #pragma unroll
+            for (int k_i = 0; k_i < 8; ++k_i) {
+                __nv_fp8_e4m3 f8; f8.__x = bytes[k_i]; out_bf[k_i] = f2bf(float(f8) * sc);
+            }
+        }
+        *reinterpret_cast<uint4*>(ks + row * TF_IDX_LD + c) = v;
+    }
+    __syncthreads();
+    const __nv_bfloat16* wr = weights + (int64_t)r * 64;
+    for (int j = 0; j < 8; ++j) {
+        float acc0[4] = {0, 0, 0, 0}, acc1[4] = {0, 0, 0, 0};
+        for (int kk = 0; kk < 128; kk += 16) {
+            uint32_t a[4], b0[2], b1[2];
+            const __nv_bfloat16* ap = qs + (warp * 16 + g) * TF_IDX_LD + kk + tq * 2;
+            a[0] = *reinterpret_cast<const uint32_t*>(ap);
+            a[1] = *reinterpret_cast<const uint32_t*>(ap + 8 * TF_IDX_LD);
+            a[2] = *reinterpret_cast<const uint32_t*>(ap + 8);
+            a[3] = *reinterpret_cast<const uint32_t*>(ap + 8 * TF_IDX_LD + 8);
+            const __nv_bfloat16* bp = ks + (j * 8 + g) * TF_IDX_LD + kk + tq * 2;
+            b0[0] = *reinterpret_cast<const uint32_t*>(bp);
+            b0[1] = *reinterpret_cast<const uint32_t*>(bp + 8);
+            if (j + 8 < 16) {
+                const __nv_bfloat16* bp1 = ks + ((j + 8) * 8 + g) * TF_IDX_LD + kk + tq * 2;
+                b1[0] = *reinterpret_cast<const uint32_t*>(bp1);
+                b1[1] = *reinterpret_cast<const uint32_t*>(bp1 + 8);
+            }
+            idx_mma16816(acc0, a, b0);
+            if (j + 8 < 16) idx_mma16816(acc1, a, b1);
+        }
+        const float w0 = fmaxf(bf2f(wr[warp * 16 + g]), 0.0f) * weights_scale;
+        const float w1 = fmaxf(bf2f(wr[warp * 16 + g + 8]), 0.0f) * weights_scale;
+        float v0 = fmaxf(acc0[0], 0.0f) * w0 + fmaxf(acc0[2], 0.0f) * w1;
+        float v1 = fmaxf(acc0[1], 0.0f) * w0 + fmaxf(acc0[3], 0.0f) * w1;
+        v0 += __shfl_xor_sync(0xffffffffu, v0, 4); v0 += __shfl_xor_sync(0xffffffffu, v0, 8); v0 += __shfl_xor_sync(0xffffffffu, v0, 16);
+        v1 += __shfl_xor_sync(0xffffffffu, v1, 4); v1 += __shfl_xor_sync(0xffffffffu, v1, 8); v1 += __shfl_xor_sync(0xffffffffu, v1, 16);
+        if (g == 0) {
+            red[warp * 64 + j * 8 + tq * 2] = v0;
+            red[warp * 64 + j * 8 + tq * 2 + 1] = v1;
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < 64; i += blockDim.x) {
+        const int t = t0 + i;
+        if (t >= max_older) continue;
+        const float total = red[i] + red[64 + i] + red[128 + i] + red[192 + i];
+        scores[(int64_t)r * max_older + t] = t < n_older ? total : -1e38f;
     }
 }

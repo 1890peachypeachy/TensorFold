@@ -177,6 +177,8 @@ pub const Runner = struct {
 
     /// `rows` tokens of one or more sequences (`segs`, rows side by side) through every layer: the linears, experts,
     /// mHC and all-reduces run once over all rows; the cache stores and attention run per sequence.
+    const TabMode = struct { any_sparse: bool, max_older: usize };
+
     pub fn forwardSegs(
         self: *const Runner,
         s: Stream,
@@ -186,13 +188,40 @@ pub const Runner = struct {
         compute_logits: bool,
         taps_out: u64,
     ) !void {
-        return self.forwardSegsFull(s, segs, sc, rows, compute_logits, false, taps_out);
+        return self.forwardSegsImpl(s, segs, null, sc, rows, compute_logits, false, taps_out);
+    }
+
+    /// Bucketed table-mode forward over all segments described in `sc.row_seg`, `sc.seg_tab`, and `sc.kv_ptrs`.
+    pub fn forwardSegsTab(
+        self: *const Runner,
+        s: Stream,
+        any_sparse: bool,
+        max_older: usize,
+        sc: *const Scratch,
+        rows: usize,
+        taps_out: u64,
+    ) !void {
+        return self.forwardSegsImpl(s, &.{}, .{ .any_sparse = any_sparse, .max_older = max_older }, sc, rows, true, false, taps_out);
     }
 
     pub fn forwardSegsFull(
         self: *const Runner,
         s: Stream,
         segs: []const Seg,
+        sc: *const Scratch,
+        rows: usize,
+        compute_logits: bool,
+        logits_last_only: bool,
+        taps_out: u64,
+    ) !void {
+        return self.forwardSegsImpl(s, segs, null, sc, rows, compute_logits, logits_last_only, taps_out);
+    }
+
+    fn forwardSegsImpl(
+        self: *const Runner,
+        s: Stream,
+        segs: []const Seg,
+        tab: ?TabMode,
         sc: *const Scratch,
         rows: usize,
         compute_logits: bool,
@@ -235,8 +264,8 @@ pub const Runner = struct {
 
             // --- 2b. Attention (HCA or MLA-DSA) -> sc.sub_out [rows, 4096] ---
             switch (ly.attn) {
-                .hca => |*hca| try self.forwardHca(s, hca, segs, li, sc, rows),
-                .dsa => |*dsa| try self.forwardDsa(s, dsa, segs, li, sc, rows),
+                .hca => |*hca| if (tab != null) try self.forwardHcaTab(s, hca, li, sc, rows) else try self.forwardHca(s, hca, segs, li, sc, rows),
+                .dsa => |*dsa| if (tab) |tm| try self.forwardDsaTab(s, dsa, tm, li, sc, rows) else try self.forwardDsa(s, dsa, segs, li, sc, rows),
             }
 
             // --- 2c. Attention mHC post ---
@@ -393,6 +422,95 @@ pub const Runner = struct {
         // 10. Gate * wo_a_out -> wo_b -> TP AllReduce -> sc.sub_out [rows, 4096]
         try k.sigmoidMulBf16(s, sc.wo_a_out, sc.o_gate, sc.wo_a_out, rows * sh.o_width);
         try self.fp8(s, sc.wo_a_out, sh.o_width, rows, hca.wo_b, sc.sub_out, sc.qmmf_part);
+        try self.allReduceBf16(s, sc.sub_out, sc.tp_gather, rows * c.hidden);
+    }
+
+    fn forwardHcaTab(self: *const Runner, s: Stream, hca: *const weights.HcaWeights, li: usize, sc: *const Scratch, rows: usize) !void {
+        const c = &self.w.config;
+        const sh = &self.w.share;
+        const k = self.k;
+        const layer_stride = self.w.loaded_layers * 3;
+        const kv_li = sc.kv_ptrs + li * 3 * 8;
+
+        try self.fp8(s, sc.layer_in, c.hidden, rows, hca.qdown_kv, sc.proj_tmp, sc.qmmf_part);
+        try k.hcaQkvPrepTab(s, sc.proj_tmp, hca.q_norm, hca.kv_norm, sc.positions, self.w.hca_inv_freq, sc.q_down, sc.row_seg, kv_li, layer_stride, rows, kv_mod.swa_mask, c.eps);
+
+        const has_comp = (hca.comp_wkv_wgate != null);
+        if (hca.comp_wkv_wgate) |cw| {
+            try self.fp8(s, sc.layer_in, c.hidden, rows, cw, sc.proj_tmp, sc.qmmf_part);
+            try k.hcaCompSavePackedTab(s, sc.proj_tmp, hca.comp_ape, sc.positions, sc.row_seg, kv_li, layer_stride, rows, kv_mod.swa_mask);
+            try k.hcaCompFlushTab(s, hca.comp_norm, sc.positions, self.w.hca_inv_freq, sc.row_seg, kv_li, layer_stride, rows, kv_mod.swa_mask, c.eps);
+        }
+
+        try self.fp8(s, sc.q_down, c.q_lora, rows, hca.qup_ogate, sc.proj_tmp, sc.qmmf_part);
+        try k.hcaQnormRopeSplit(s, sc.proj_tmp, sc.positions, self.w.hca_inv_freq, sc.q_up, sc.o_gate, rows, sh.heads, sh.o_width, c.eps);
+
+        const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(c.head_dim))));
+        try k.hcaAttnMmaTab(s, sc.q_up, hca.attn_sink, sc.positions, sc.attn_o, sc.attn_split_o, sc.attn_split_m, sc.attn_split_l, sc.row_seg, sc.seg_tab, kv_li, layer_stride, has_comp, rows, kv_mod.swa_mask, c.sliding_window, 8, scale);
+
+        try k.vhaUProjBf16(s, sc.attn_o, hca.vha_u, sc.vha_z, rows, sh.heads, c.head_dim);
+        try self.allReduceBf16(s, sc.vha_z, sc.vha_z_all, rows * c.vha_rank * c.head_dim);
+        try k.vhaVAddBf16(s, sc.attn_o, hca.vha_v, sc.vha_z, rows, sh.heads, c.head_dim);
+        try k.ropeGptj(s, sc.attn_o, sc.positions, self.w.hca_inv_freq, rows, sh.heads, c.head_dim, c.qk_nope, -1);
+
+        const group_k: usize = (c.heads / c.o_groups) * c.head_dim;
+        const ldx: usize = sh.groups * group_k;
+        for (0..sh.groups) |g| {
+            const x_ptr = sc.attn_o + g * group_k * 2;
+            const y_ptr = sc.q_up + g * rows * c.o_lora * 2;
+            try self.fp8(s, x_ptr, ldx, rows, hca.wo_a[g], y_ptr, sc.qmmf_part);
+        }
+        try k.interleaveGroups(s, sc.q_up, sc.wo_a_out, sh.groups, rows, c.o_lora);
+
+        try k.sigmoidMulBf16(s, sc.wo_a_out, sc.o_gate, sc.wo_a_out, rows * sh.o_width);
+        try self.fp8(s, sc.wo_a_out, sh.o_width, rows, hca.wo_b, sc.sub_out, sc.qmmf_part);
+        try self.allReduceBf16(s, sc.sub_out, sc.tp_gather, rows * c.hidden);
+    }
+
+    fn forwardDsaTab(self: *const Runner, s: Stream, dsa: *const weights.DsaWeights, tm: TabMode, li: usize, sc: *const Scratch, rows: usize) !void {
+        const c = &self.w.config;
+        const sh = &self.w.share;
+        const k = self.k;
+        const layer_stride = self.w.loaded_layers * 3;
+        const kv_li = sc.kv_ptrs + li * 3 * 8;
+
+        try self.fp8(s, sc.layer_in, c.hidden, rows, dsa.qa_kva, sc.proj_tmp, sc.qmmf_part);
+        try k.dsaQkvPrepTab(s, sc.proj_tmp, dsa.q_a_norm, dsa.kv_a_norm, sc.positions, self.w.mla_inv_freq, sc.q_down, sc.row_seg, kv_li, layer_stride, rows, c.eps);
+
+        try self.fp8(s, sc.layer_in, c.hidden, rows, dsa.idx_wk, sc.idx_k, sc.qmmf_part);
+        try k.layerNorm(s, sc.idx_k, dsa.idx_k_norm_w, dsa.idx_k_norm_b, sc.idx_k, rows, c.index_dim, c.eps);
+        try k.ropeNeox(s, sc.idx_k, sc.positions, self.w.mla_inv_freq, rows, 1, c.index_dim, 0);
+        try k.hadamard128(s, sc.idx_k, rows);
+        try k.dsaIdxKStoreTab(s, sc.idx_k, sc.positions, sc.row_seg, kv_li, layer_stride, rows);
+
+        const dense_width = c.index_topk + c.sliding_window;
+        if (tm.any_sparse) {
+            try self.fp8(s, sc.q_down, c.mla_q_lora, rows, dsa.idx_wq_b, sc.idx_q, sc.qmmf_part);
+            try k.ropeNeox(s, sc.idx_q, sc.positions, self.w.mla_inv_freq, rows, c.index_heads, c.index_dim, 0);
+            try k.hadamard128(s, sc.idx_q, rows * c.index_heads);
+            try self.fp8(s, sc.layer_in, c.hidden, rows, dsa.idx_weights_proj, sc.idx_w, sc.qmmf_part);
+
+            const w_scale: f32 = @floatCast(1.0 / (@sqrt(@as(f64, @floatFromInt(c.index_dim))) * @sqrt(@as(f64, @floatFromInt(c.index_heads)))));
+            if (rows * tm.max_older > @min(sc.max_rows, 64) * sc.capacity) return error.IndexerScoresTooSmall;
+            try k.dsaIndexerScoresMmaTab(s, sc.idx_q, sc.idx_w, sc.positions, sc.idx_scores, sc.row_seg, sc.seg_tab, kv_li, layer_stride, rows, tm.max_older, c.sliding_window, w_scale);
+            try k.dsaSelectTopkTab(s, sc.idx_scores, sc.positions, sc.idx_sel, sc.idx_cnt, sc.row_seg, sc.seg_tab, rows, tm.max_older, c.index_topk, c.sliding_window);
+        }
+
+        const q_head = c.mla_qk_nope + c.mla_qk_rope;
+        try self.fp8(s, sc.q_down, c.mla_q_lora, rows, dsa.qb_ogate, sc.proj_tmp, sc.qmmf_part);
+        try k.dsaQbRopeSplit(s, sc.proj_tmp, sc.positions, self.w.mla_inv_freq, sc.q_up, sc.o_gate, rows, sh.heads, sh.dsa_o_width);
+        try k.dsaAbsorbQ(s, sc.q_up, dsa.wk, sc.q_abs, rows, sh.heads);
+
+        const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(q_head))));
+        try k.dsaAttnMmaTab(s, sc.q_abs, sc.idx_sel, sc.idx_cnt, dsa.sinks, sc.positions, sc.attn_o, sc.attn_split_o, sc.attn_split_m, sc.attn_split_l, sc.row_seg, sc.seg_tab, kv_li, layer_stride, rows, dense_width, 12, scale);
+        try k.dsaExpandV(s, sc.attn_o, dsa.wv, sc.attn_o_v, rows, sh.heads);
+
+        try k.vhaUProjBf16(s, sc.attn_o_v, dsa.vha_u, sc.vha_z, rows, sh.heads, c.mla_v_dim);
+        try self.allReduceBf16(s, sc.vha_z, sc.vha_z_all, rows * c.vha_rank * c.mla_v_dim);
+        try k.vhaVAddBf16(s, sc.attn_o_v, dsa.vha_v, sc.vha_z, rows, sh.heads, c.mla_v_dim);
+
+        try k.sigmoidMulBf16(s, sc.attn_o_v, sc.o_gate, sc.attn_o_v, rows * sh.dsa_o_width);
+        try self.fp8(s, sc.attn_o_v, sh.dsa_o_width, rows, dsa.o_proj, sc.sub_out, sc.qmmf_part);
         try self.allReduceBf16(s, sc.sub_out, sc.tp_gather, rows * c.hidden);
     }
 

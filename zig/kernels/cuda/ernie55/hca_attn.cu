@@ -555,25 +555,38 @@ extern "C" __global__ void tf_ernie55_hca_comp_save_packed(
 
 // SM121a Tensor-Core FlashAttention + Split-K for HCA (H_loc=16, D_QK=512, D_V=512, LD=520)
 // Launch: grid=(splits, rows), block=(128), smem=53184
-extern "C" __global__ void __launch_bounds__(128) tf_ernie55_hca_attn_mma(
-    const __nv_bfloat16* __restrict__ q,       // [rows, 16, 512]
-    const __nv_bfloat16* __restrict__ swa_kv,  // [swa_cap, 512]
-    const __nv_bfloat16* __restrict__ comp_kv, // nullable [comp_cap, 512]
-    const float* __restrict__ attn_sink,       // [16]
-    const int32_t* __restrict__ positions,     // [rows]
-    __nv_bfloat16* __restrict__ out,           // [rows, 16, 512] (written when splits == 1)
-    float* __restrict__ opart,                 // [rows, splits, 16, 512] (written when splits > 1)
-    float* __restrict__ mpart,                 // [rows, splits, 16]
-    float* __restrict__ lpart,                 // [rows, splits, 16]
-    int rows,
+struct TFHcaSegEntry {
+    uint64_t stash_ptr;
+    int32_t row0;
+    int32_t n;
+    int32_t max_pos;
+    int32_t older_ceil;
+    int32_t sparse;
+    int32_t pad;
+};
+
+__device__ __forceinline__ int tf_hca_attn_splits(int n, int max_sp) {
+    return (n > 16) ? 1 : (n <= 4) ? max_sp : (n <= 8) ? 6 : 2;
+}
+
+__device__ __forceinline__ void hca_attn_mma_impl(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ swa_kv,
+    const __nv_bfloat16* __restrict__ comp_kv,
+    const float* __restrict__ attn_sink,
+    const int32_t* __restrict__ positions,
+    __nv_bfloat16* __restrict__ out,
+    float* __restrict__ opart,
+    float* __restrict__ mpart,
+    float* __restrict__ lpart,
+    int r,
+    int sp,
     int swa_mask,
     int window_size,
     int splits,
+    int split_stride,
     float scale
 ) {
-    int r = blockIdx.y;
-    int sp = blockIdx.x;
-    if (r >= rows) return;
 
     int pos = positions[r];
     int swa_start = (pos >= window_size - 1) ? (pos - (window_size - 1)) : 0;
@@ -586,8 +599,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_hca_attn_mma(
     int k_end = (k_start + chunk < total_k) ? (k_start + chunk) : total_k;
 
     constexpr int LD = 520;
-    extern __shared__ unsigned char raw[];
-    __nv_bfloat16* s_q = reinterpret_cast<__nv_bfloat16*>(raw);
+    extern __shared__ unsigned char raw_hca_mma[];
+    __nv_bfloat16* s_q = reinterpret_cast<__nv_bfloat16*>(raw_hca_mma);
     __nv_bfloat16* s_k = s_q + 16 * LD;
     float* s_sc = reinterpret_cast<float*>(s_k + 32 * LD);
     __nv_bfloat16* s_p = reinterpret_cast<__nv_bfloat16*>(s_sc + 16 * 32);
@@ -726,11 +739,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_hca_attn_mma(
         }
     } else {
         if (tid < 16) {
-            mpart[((int64_t)r * splits + sp) * 16 + tid] = s_m[tid];
-            lpart[((int64_t)r * splits + sp) * 16 + tid] = s_l[tid];
+            mpart[((int64_t)r * split_stride + sp) * 16 + tid] = s_m[tid];
+            lpart[((int64_t)r * split_stride + sp) * 16 + tid] = s_l[tid];
         }
-        float* o0 = opart + (((int64_t)r * splits + sp) * 16 + g) * 512;
-        float* o1 = opart + (((int64_t)r * splits + sp) * 16 + g + 8) * 512;
+        float* o0 = opart + (((int64_t)r * split_stride + sp) * 16 + g) * 512;
+        float* o1 = opart + (((int64_t)r * split_stride + sp) * 16 + g + 8) * 512;
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
             int dn = d_warp + j * 8 + tq * 2;
@@ -742,6 +755,60 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_hca_attn_mma(
     }
 }
 
+
+extern "C" __global__ void __launch_bounds__(128) tf_ernie55_hca_attn_mma(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ swa_kv,
+    const __nv_bfloat16* __restrict__ comp_kv,
+    const float* __restrict__ attn_sink,
+    const int32_t* __restrict__ positions,
+    __nv_bfloat16* __restrict__ out,
+    float* __restrict__ opart,
+    float* __restrict__ mpart,
+    float* __restrict__ lpart,
+    int rows,
+    int swa_mask,
+    int window_size,
+    int splits,
+    float scale
+) {
+    int r = blockIdx.y;
+    int sp = blockIdx.x;
+    if (r >= rows) return;
+    hca_attn_mma_impl(q, swa_kv, comp_kv, attn_sink, positions, out, opart, mpart, lpart, r, sp, swa_mask, window_size, splits, splits, scale);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_ernie55_hca_attn_mma_tab(
+    const __nv_bfloat16* __restrict__ q,
+    const float* __restrict__ attn_sink,
+    const int32_t* __restrict__ positions,
+    __nv_bfloat16* __restrict__ out,
+    float* __restrict__ opart,
+    float* __restrict__ mpart,
+    float* __restrict__ lpart,
+    const int32_t* __restrict__ row_seg,
+    const TFHcaSegEntry* __restrict__ seg_tab,
+    const uint64_t* __restrict__ kv_ptrs,
+    int layer_off,
+    int has_comp,
+    int rows,
+    int swa_mask,
+    int window_size,
+    int max_sp,
+    float scale
+) {
+    int r = blockIdx.y;
+    int sp = blockIdx.x;
+    if (r >= rows) return;
+    int seg = row_seg[r];
+    if (seg < 0) return;
+    int splits = tf_hca_attn_splits(seg_tab[seg].n, max_sp);
+    if (sp >= splits) return;
+    const uint64_t* p = kv_ptrs + seg * layer_off;
+    const __nv_bfloat16* swa_kv = reinterpret_cast<const __nv_bfloat16*>(p[0]);
+    const __nv_bfloat16* comp_kv = has_comp ? reinterpret_cast<const __nv_bfloat16*>(p[2]) : nullptr;
+    hca_attn_mma_impl(q, swa_kv, comp_kv, attn_sink, positions, out, opart, mpart, lpart, r, sp, swa_mask, window_size, splits, max_sp, scale);
+}
 // SM121a Tensor-Core non-causal ring-buffer HCA attention for DSpark (H_loc=16, D_QK=512, LD=520)
 // Computes lo = max(0, positions[0] + 1 - window_size), hi = positions[0] + B - 1 on device (CUDA-graph safe!).
 // Launch: grid=(splits, B), block=(128), smem=53184
@@ -1124,4 +1191,173 @@ extern "C" __global__ void __launch_bounds__(512) tf_ernie55_hca_attn_prefill_mm
             orow[(g + 8) * 512 + c0+1] = f2bf(acc[j][3] * inv1);
         }
     }
+}
+
+extern "C" __global__ void tf_ernie55_hca_qkv_prep_tab(
+    const __nv_bfloat16* __restrict__ packed,
+    const __nv_bfloat16* __restrict__ q_norm,
+    const __nv_bfloat16* __restrict__ kv_norm,
+    const int32_t* __restrict__ positions,
+    const float* __restrict__ inv_freq,
+    __nv_bfloat16* __restrict__ q_down,
+    const int32_t* __restrict__ row_seg,
+    const uint64_t* __restrict__ kv_ptrs,
+    int layer_off,
+    int rows,
+    int swa_mask,
+    float eps
+) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    int seg = row_seg[r];
+    if (seg < 0) return;
+    __nv_bfloat16* swa_kv = reinterpret_cast<__nv_bfloat16*>(kv_ptrs[seg * layer_off + 0]);
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    __shared__ float s_red[8];
+    const __nv_bfloat16* src = packed + (int64_t)r * 1536;
+    float q0 = bf2f(src[tid]), q1 = bf2f(src[tid + 256]), q2 = bf2f(src[tid + 512]), q3 = bf2f(src[tid + 768]);
+    float qsq = warp_sum(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    if (lane == 0) s_red[warp] = qsq;
+    __syncthreads();
+    if (warp == 0) { float t = (lane < 8) ? s_red[lane] : 0.0f; t = warp_sum(t); if (lane == 0) s_red[0] = rsqrtf(t / 1024.0f + eps); }
+    __syncthreads();
+    float q_rrms = s_red[0];
+    __nv_bfloat16* qdst = q_down + (int64_t)r * 1024;
+    qdst[tid] = f2bf(q0 * q_rrms * bf2f(q_norm[tid]));
+    qdst[tid + 256] = f2bf(q1 * q_rrms * bf2f(q_norm[tid + 256]));
+    qdst[tid + 512] = f2bf(q2 * q_rrms * bf2f(q_norm[tid + 512]));
+    qdst[tid + 768] = f2bf(q3 * q_rrms * bf2f(q_norm[tid + 768]));
+
+    const __nv_bfloat16* ksrc = src + 1024;
+    float k0 = bf2f(ksrc[2 * tid]), k1 = bf2f(ksrc[2 * tid + 1]);
+    float ksq = warp_sum(k0 * k0 + k1 * k1);
+    __syncthreads();
+    if (lane == 0) s_red[warp] = ksq;
+    __syncthreads();
+    if (warp == 0) { float t = (lane < 8) ? s_red[lane] : 0.0f; t = warp_sum(t); if (lane == 0) s_red[0] = rsqrtf(t / 512.0f + eps); }
+    __syncthreads();
+    float k_rrms = s_red[0];
+    float e = bf2f(f2bf(k0 * k_rrms * bf2f(kv_norm[2 * tid])));
+    float o = bf2f(f2bf(k1 * k_rrms * bf2f(kv_norm[2 * tid + 1])));
+    int pos = positions[r];
+    if (tid >= 224) {
+        int pair = tid - 224; float c, sv; __sincosf((float)pos * inv_freq[pair], &sv, &c);
+        float ne = e * c - o * sv, no = o * c + e * sv; e = ne; o = no;
+    }
+    __nv_bfloat16* kdst = swa_kv + (int64_t)(pos & swa_mask) * 512;
+    kdst[2 * tid] = f2bf(e); kdst[2 * tid + 1] = f2bf(o);
+}
+
+extern "C" __global__ void tf_ernie55_hca_comp_save_packed_tab(
+    const __nv_bfloat16* __restrict__ packed,
+    const float* __restrict__ ape,
+    const int32_t* __restrict__ positions,
+    const int32_t* __restrict__ row_seg,
+    const uint64_t* __restrict__ kv_ptrs,
+    int layer_off,
+    int rows,
+    int state_mask
+) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    int seg = row_seg[r];
+    if (seg < 0) return;
+    float* comp_state = reinterpret_cast<float*>(kv_ptrs[seg * layer_off + 1]);
+    int pos = positions[r], slot = pos & state_mask, ape_row = pos & 127;
+    const __nv_bfloat16* kvr = packed + (int64_t)r * 1024;
+    const __nv_bfloat16* gr = kvr + 512;
+    const float* ar = ape + (int64_t)ape_row * 512;
+    float* dst_kv = comp_state + (int64_t)slot * 1024;
+    float* dst_sc = dst_kv + 512;
+    for (int d = threadIdx.x; d < 512; d += blockDim.x) {
+        dst_kv[d] = bf2f(kvr[d]);
+        dst_sc[d] = bf2f(gr[d]) + ar[d];
+    }
+}
+
+extern "C" __global__ void tf_ernie55_hca_comp_flush_tab(
+    const __nv_bfloat16* __restrict__ norm_w,
+    const int32_t* __restrict__ positions,
+    const float* __restrict__ inv_freq,
+    const int32_t* __restrict__ row_seg,
+    const uint64_t* __restrict__ kv_ptrs,
+    int layer_off,
+    int rows,
+    int state_mask,
+    float eps
+) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    int seg = row_seg[r];
+    if (seg < 0) return;
+    int pos = positions[r];
+    if (((pos + 1) & 127) != 0) return;
+    const float* comp_state = reinterpret_cast<const float*>(kv_ptrs[seg * layer_off + 1]);
+    __nv_bfloat16* comp_kv = reinterpret_cast<__nv_bfloat16*>(kv_ptrs[seg * layer_off + 2]);
+    int blk = pos >> 7, s0 = blk << 7;
+    __shared__ float s_ckv[512]; __shared__ float s_red[32];
+    for (int pass = 0; pass < 2; ++pass) {
+        int d = threadIdx.x + pass * 256; float mx = -1e38f;
+        for (int t = 0; t < 128; ++t) { int slot = (s0 + t) & state_mask; mx = fmaxf(mx, comp_state[(int64_t)slot * 1024 + 512 + d]); }
+        float denom = 0.0f, wsum = 0.0f;
+        for (int t = 0; t < 128; ++t) {
+            int slot = (s0 + t) & state_mask;
+            float p = expf(comp_state[(int64_t)slot * 1024 + 512 + d] - mx);
+            denom += p; wsum += p * comp_state[(int64_t)slot * 1024 + d];
+        }
+        s_ckv[d] = wsum / denom;
+    }
+    __syncthreads();
+    float v0 = s_ckv[2 * threadIdx.x], v1 = s_ckv[2 * threadIdx.x + 1];
+    float sq = warp_sum(v0 * v0 + v1 * v1);
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) s_red[warp] = sq;
+    __syncthreads();
+    if (warp == 0) { float tot = (lane < 8) ? s_red[lane] : 0.0f; tot = warp_sum(tot); if (lane == 0) s_red[0] = rsqrtf(tot / 512.0f + eps); }
+    __syncthreads();
+    float rrms = s_red[0];
+    float e = bf2f(f2bf(v0 * rrms * bf2f(norm_w[2 * threadIdx.x])));
+    float o = bf2f(f2bf(v1 * rrms * bf2f(norm_w[2 * threadIdx.x + 1])));
+    if (threadIdx.x >= 224) {
+        int pair = threadIdx.x - 224; float c, sv; __sincosf((float)s0 * inv_freq[pair], &sv, &c);
+        float ne = e * c - o * sv, no = o * c + e * sv; e = ne; o = no;
+    }
+    __nv_bfloat16* dst = comp_kv + (int64_t)blk * 512;
+    dst[2 * threadIdx.x] = f2bf(e); dst[2 * threadIdx.x + 1] = f2bf(o);
+}
+
+extern "C" __global__ void tf_ernie55_attn_splitk_combine_tab(
+    const float* __restrict__ opart,
+    const float* __restrict__ mpart,
+    const float* __restrict__ lpart,
+    __nv_bfloat16* __restrict__ out,
+    const int32_t* __restrict__ row_seg,
+    const TFHcaSegEntry* __restrict__ seg_tab,
+    int rows,
+    int max_sp,
+    int stride_sp
+) {
+    int r = blockIdx.y, h = blockIdx.x, d = threadIdx.x;
+    if (r >= rows || h >= 16) return;
+    int seg = row_seg[r];
+    if (seg < 0) return;
+    int splits = tf_hca_attn_splits(seg_tab[seg].n, max_sp);
+    if (splits <= 1) return;
+    const float* mr = mpart + (int64_t)r * stride_sp * 16;
+    const float* lr = lpart + (int64_t)r * stride_sp * 16;
+    float mmax = -1e38f;
+    for (int s = 0; s < splits; ++s) mmax = fmaxf(mmax, mr[s * 16 + h]);
+    float lsum = 0.0f, v0 = 0.0f, v1 = 0.0f;
+    for (int s = 0; s < splits; ++s) {
+        float ls = lr[s * 16 + h];
+        if (ls > 0.0f) {
+            float w = expf(mr[s * 16 + h] - mmax);
+            lsum += ls * w;
+            const float* op = opart + ((int64_t)r * stride_sp + s) * 16 * 512 + h * 512;
+            v0 += op[d] * w; v1 += op[d + 256] * w;
+        }
+    }
+    float inv = 1.0f / lsum;
+    __nv_bfloat16* dst = out + ((int64_t)r * 16 + h) * 512;
+    dst[d] = f2bf(v0 * inv); dst[d + 256] = f2bf(v1 * inv);
 }

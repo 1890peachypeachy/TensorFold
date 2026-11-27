@@ -115,6 +115,16 @@ pub const KvCache = struct {
 };
 
 /// Reusable device scratch for up to `max_rows` tokens in one forward pass.
+pub const SegEntry = extern struct {
+    stash_ptr: u64,
+    row0: i32,
+    n: i32,
+    max_pos: i32,
+    older_ceil: i32,
+    sparse: i32,
+    pad: i32 = 0,
+};
+
 pub const Scratch = struct {
     max_rows: usize,
     capacity: usize,
@@ -183,6 +193,9 @@ pub const Scratch = struct {
     argmax_id: u64, // i32 [max_rows]
     argmax_val: u64, // F32 [max_rows]
     proj_tmp: u64, // BF16 [max_rows, max_proj_n]
+    row_seg: u64, // i32 [max_rows]
+    seg_tab: u64, // SegEntry [8]
+    kv_ptrs: u64, // u64 [8 * 43 * 3]
     attn_split_o: u64, // F32 [16, 12, 16, 512]
     attn_split_m: u64, // F32 [16, 12, 16]
     attn_split_l: u64, // F32 [16, 12, 16]
@@ -265,9 +278,13 @@ pub const Scratch = struct {
         const o_argmax_id = reserve(&off, R * 4);
         const o_argmax_val = reserve(&off, R * 4);
         const o_proj_tmp = reserve(&off, R * max_proj_n * 2);
-        const o_attn_split_o = reserve(&off, 16 * 12 * 16 * 512 * 4);
-        const o_attn_split_m = reserve(&off, 16 * 12 * 16 * 4);
-        const o_attn_split_l = reserve(&off, 16 * 12 * 16 * 4);
+        const o_row_seg = reserve(&off, R * 4);
+        const o_seg_tab = reserve(&off, 8 * @sizeOf(SegEntry));
+        const o_kv_ptrs = reserve(&off, 8 * 64 * 3 * 8);
+        const split_rows: usize = if (R <= 64) R else 16;
+        const o_attn_split_o = reserve(&off, split_rows * 12 * 16 * 512 * 4);
+        const o_attn_split_m = reserve(&off, split_rows * 12 * 16 * 4);
+        const o_attn_split_l = reserve(&off, split_rows * 12 * 16 * 4);
 
         s.buf = try DeviceBuffer.alloc(d, off);
         const b = s.buf.ptr;
@@ -325,6 +342,9 @@ pub const Scratch = struct {
         s.argmax_id = b + o_argmax_id;
         s.argmax_val = b + o_argmax_val;
         s.proj_tmp = b + o_proj_tmp;
+        s.row_seg = b + o_row_seg;
+        s.seg_tab = b + o_seg_tab;
+        s.kv_ptrs = b + o_kv_ptrs;
         s.attn_split_o = b + o_attn_split_o;
         s.attn_split_m = b + o_attn_split_m;
         s.attn_split_l = b + o_attn_split_l;
