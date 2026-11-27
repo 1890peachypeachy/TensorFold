@@ -21,6 +21,8 @@ pub const Seq = struct {
     draft: ?dspark.Caches = null,
     stash: ?cuda.DeviceBuffer = null, // BF16 [window_rows, 12288] target aux taps from last verify
     first_logits: ?cuda.DeviceBuffer = null, // F32 [vocab_width] last prompt row logits for firstMasked
+    mark_ring: ?cuda.DeviceBuffer = null, // draft ring copied at a late mark inside a chunk
+    mark_at: usize = 0, // the position `mark_ring` stands at (0: none)
     sampling: ?sampler.Sampling = null,
     verify_graphs: [8]?cuda.graph.Exec = @splat(null),
     verify_warmed: [8]bool = @splat(false),
@@ -50,6 +52,7 @@ pub const Seq = struct {
             g.* = null;
         };
         if (self.first_logits) |*fl| fl.free();
+        if (self.mark_ring) |*mr| mr.free();
         if (self.stash) |*st| st.free();
         if (self.draft) |*dr| dr.deinit();
         self.kv.deinit();
@@ -62,7 +65,7 @@ pub const Kept = struct { id: u64, at: u32 };
 pub const Resume = struct { id: u64, at: usize };
 const Snap = struct { buf: cuda.DeviceBuffer, at: usize };
 /// Kept states stand on the prompt grid; the HCA rings keep this many positions below one.
-const snap_ring: usize = 128;
+pub const snap_ring: usize = 128;
 
 /// One stream's window in a shared verify: its slot, its ids (pending token, then drafts), its draws.
 pub const Part = struct { slot: u32, ids: []const u32, out: []u32 };
@@ -297,13 +300,23 @@ pub const Engine = struct {
         }
     }
 
+    /// Keep up to 2 warm sequence slots pooled across requests so sequential/c2 turns skip
+    /// ~150 ms of cuMemAlloc + 4.3 GiB zero-fill and keep their captured CUDA graphs hot.
+    const pooled_slots: u32 = 2;
+
     pub fn release(e: *Engine, slot: u32) void {
-        e.invalidateSharedSlot(slot);
         if (slot < e.seqs.items.len) {
             if (e.seqs.items[slot]) |sq| {
-                sq.deinit();
-                e.gpa.destroy(sq);
-                e.seqs.items[slot] = null;
+                if (slot < pooled_slots) {
+                    sq.kv.reset();
+                    sq.mark_at = 0;
+                    sq.sampling = null;
+                } else {
+                    e.invalidateSharedSlot(slot);
+                    sq.deinit();
+                    e.gpa.destroy(sq);
+                    e.seqs.items[slot] = null;
+                }
             }
             if (e.slot == slot) e.cur = null;
         }
@@ -321,7 +334,7 @@ pub const Engine = struct {
 
     /// Run one prompt chunk (`ids.len <= prompt_rows`) starting at `pos0` of a `total`-token prompt.
     /// If `is_last`, saves last row's logits for `firstMasked` and returns the drawn first token.
-    pub fn chunk(e: *Engine, ids: []const u32, pos0: usize, total: usize, is_last: bool, resume_id: u64) !u32 {
+    pub fn chunk(e: *Engine, ids: []const u32, pos0: usize, total: usize, is_last: bool, resume_id: u64, late_mark: usize) !u32 {
         const sq = e.cur orelse return error.NoSequence;
         const n = ids.len;
         if (n == 0 or n > prompt_rows or pos0 + n > e.capacity) return error.BadChunk;
@@ -330,6 +343,7 @@ pub const Engine = struct {
             if (at != pos0) return error.SnapshotOutOfStep;
         }
         if (sq.kv.pos != pos0) return error.ChunkOutOfStep;
+        sq.mark_at = 0;
 
         var ids_i32: [prompt_rows]i32 = undefined;
         var pos_i32: [prompt_rows]i32 = undefined;
@@ -348,7 +362,19 @@ pub const Engine = struct {
         const r = e.runner();
         try r.forwardWithTapsLastOnly(e.stream, &sq.kv, &e.sc_pf, n, pos0 + n - 1, is_last, taps_ptr);
 
-        if (need_taps) try e.drafter.?.absorb(&r, e.stream, &sq.draft.?, &e.sc_pf, e.sc_pf.dspark_taps, n, pos0);
+        if (late_mark > pos0 and late_mark < pos0 + n) sq.mark_at = late_mark;
+        if (need_taps) {
+            if (sq.mark_at != 0) {
+                // A state kept at the mark inside this chunk: absorb up to it, stash the draft ring, absorb the rest.
+                const kk = late_mark - pos0;
+                const dc = &sq.draft.?;
+                try e.drafter.?.absorb(&r, e.stream, dc, &e.sc_pf, e.sc_pf.dspark_taps, kk, pos0);
+                const rb = dspark.num_layers * dc.layer_bytes;
+                if (sq.mark_ring == null) sq.mark_ring = try cuda.DeviceBuffer.alloc(e.d, rb);
+                try e.copy(sq.mark_ring.?.ptr, dc.buf.ptr, rb);
+                try e.drafter.?.absorb(&r, e.stream, dc, &e.sc_pf, e.sc_pf.dspark_taps + kk * (3 * e.w.config.hidden) * 2, n - kk, late_mark);
+            } else try e.drafter.?.absorb(&r, e.stream, &sq.draft.?, &e.sc_pf, e.sc_pf.dspark_taps, n, pos0);
+        }
 
         if (is_last) {
             // Save last row F32 logits (written to slot 0 by forwardWithTapsLastOnly) for optional firstMasked redraw
@@ -767,14 +793,22 @@ pub const Engine = struct {
         }
         if (sq.draft) |*dc| {
             const n = dspark.num_layers * dc.layer_bytes;
-            try e.copy(if (out) buf + off else dc.buf.ptr, if (out) dc.buf.ptr else buf + off, n);
+            const draft_src = if (out and sq.mark_at == at and sq.mark_ring != null) sq.mark_ring.?.ptr else dc.buf.ptr;
+            try e.copy(if (out) buf + off else dc.buf.ptr, if (out) draft_src else buf + off, n);
         }
+    }
+
+    /// `at` is a state the bound sequence can keep now: its position, or a late mark just below it.
+    pub fn keepable(e: *const Engine, at: usize) bool {
+        const sq = e.cur orelse return false;
+        if (at == 0 or at > sq.kv.pos) return false;
+        return sq.kv.pos - at < snap_ring or (sq.mark_at == at and sq.kv.pos - at <= prompt_rows);
     }
 
     /// The bound sequence's state at its position `at` (a chunk start) copied under `id` (every rank keeps one id).
     pub fn keepAs(e: *Engine, id: u64, at: usize) !void {
         const sq = e.cur orelse return error.NoSequence;
-        if (at == 0 or at != sq.kv.pos or at % snap_grid != 0 or e.snaps.contains(id)) return error.BadKeep;
+        if (!e.keepable(at) or at % snap_grid != 0 or e.snaps.contains(id)) return error.BadKeep;
         var buf = try cuda.DeviceBuffer.alloc(e.d, e.stateBytes(at));
         errdefer buf.free();
         try e.copyState(sq, buf.ptr, at, true);

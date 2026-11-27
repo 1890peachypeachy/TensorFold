@@ -59,7 +59,7 @@ pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
 pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
     _ = owner;
     const own: *Owned = @ptrCast(@alignCast(ptr));
-    if (own.e.pos() != at) return error.NotAtMark;
+    if (!own.e.keepable(at)) return error.NotAtMark;
     const k = try own.gpa.create(engine.Kept);
     errdefer own.gpa.destroy(k);
     k.* = try own.lanes.x.save(at);

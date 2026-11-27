@@ -193,14 +193,27 @@ pub const Lanes = struct {
         const pos0 = l.fill.?;
         if (resume_id == 0) mark(s, pos0);
         var take_n: usize = @min(prompt.len - pos0, engine.prompt_rows);
-        for (s.reuse.marks) |m| { // end the chunk where the cache wants a state kept
-            if (m > pos0 and m < pos0 + take_n) take_n = m - pos0;
+        var late_mark: usize = 0;
+        if (prompt.len - pos0 <= engine.prompt_rows) {
+            // Entire remaining prompt fits in one chunk: never split it for intermediate marks
+            // (splitting costs a whole extra ~250-550ms weight-streaming forward pass + redundant alloc).
+            // Run the full chunk in one pass and keep the final mark (if any) at the end.
+            var last_mark: usize = 0;
+            for (s.reuse.marks) |m| {
+                if (m > pos0 and m < prompt.len) last_mark = @max(last_mark, m);
+            }
+            late_mark = last_mark;
+        } else {
+            for (s.reuse.marks) |m| { // end the chunk where the cache wants a state kept
+                if (m > pos0 and m < pos0 + take_n) take_n = m - pos0;
+            }
         }
         const is_last = (pos0 + take_n == prompt.len);
-        const tok = self.x.chunk(prompt[pos0 .. pos0 + take_n], pos0, prompt.len, is_last, resume_id) catch |err| {
+        const tok = self.x.chunk(prompt[pos0 .. pos0 + take_n], pos0, prompt.len, is_last, resume_id, late_mark) catch |err| {
             l.fill = null;
             return err;
         };
+        if (late_mark != 0) mark(s, late_mark);
         l.fill = pos0 + take_n;
         if (is_last) {
             l.first = self.take(tok);

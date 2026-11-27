@@ -139,7 +139,7 @@ pub const Leader = struct {
     pub fn save(x: Leader, at: usize) !engine.Kept {
         const id = x.e.next_snap;
         x.e.next_snap += 1; // an id is used once, even when this rank's copy then fails
-        if (at == 0 or at != x.e.pos()) return error.BadKeep;
+        if (!x.e.keepable(at)) return error.BadKeep;
         try x.send(.{ .kind = @intFromEnum(Kind.save), .a = id, .seed = at }, &.{});
         x.e.keepAs(id, at) catch |err| {
             x.drop(id); // the other ranks free their copy at the next step
@@ -173,15 +173,16 @@ pub const Leader = struct {
         try x.e.begin(s);
     }
 
-    pub fn chunk(x: Leader, ids: []const u32, pos0: usize, total: usize, is_last: bool, resume_id: u64) !u32 {
+    pub fn chunk(x: Leader, ids: []const u32, pos0: usize, total: usize, is_last: bool, resume_id: u64, late_mark: usize) !u32 {
         try x.send(.{
             .kind = @intFromEnum(Kind.chunk),
             .depth = @intCast(pos0),
             .flags = if (is_last) 1 else 0,
             .a = total,
             .seed = resume_id,
+            .top_k = @intCast(late_mark),
         }, ids);
-        return x.e.chunk(ids, pos0, total, is_last, resume_id);
+        return x.e.chunk(ids, pos0, total, is_last, resume_id, late_mark);
     }
 
     pub fn firstMasked(x: Leader, bits: u64, masks: []const u32) !u32 {
@@ -293,7 +294,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
             },
             .chunk => {
                 try e.bind(h.slot);
-                _ = try e.chunk(msg.ids, h.depth, @intCast(h.a), h.flags != 0, h.seed);
+                _ = try e.chunk(msg.ids, h.depth, @intCast(h.a), h.flags != 0, h.seed, h.top_k);
             },
             .first_masked => {
                 try e.bind(h.slot);
