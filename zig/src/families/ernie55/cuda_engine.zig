@@ -10,9 +10,9 @@ const fw = @import("cuda_forward.zig");
 const dspark = @import("cuda_dspark.zig");
 const sampler = @import("cuda_sampler.zig");
 
-pub const prompt_rows: usize = 1024;
+pub const prompt_rows: usize = 4096;
 /// Kept prompt states stand on this grid (chunks end early at a mark the cache asked for).
-pub const snap_grid: usize = 256;
+pub const snap_grid: usize = 128;
 pub const window_rows: usize = 32;
 pub const max_slots: usize = 16;
 
@@ -62,7 +62,7 @@ pub const Kept = struct { id: u64, at: u32 };
 pub const Resume = struct { id: u64, at: usize };
 const Snap = struct { buf: cuda.DeviceBuffer, at: usize };
 /// Kept states stand on the prompt grid; the HCA rings keep this many positions below one.
-const snap_ring: usize = 256;
+const snap_ring: usize = 128;
 
 /// One stream's window in a shared verify: its slot, its ids (pending token, then drafts), its draws.
 pub const Part = struct { slot: u32, ids: []const u32, out: []u32 };

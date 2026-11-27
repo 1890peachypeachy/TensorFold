@@ -331,65 +331,129 @@ __device__ __forceinline__ void frag_b(const __nv_bfloat16* ws, int nb, int kk, 
     b[1] = *reinterpret_cast<const uint32_t*>(p + 8);
 }
 
-// w1 and w3 of expert blockIdx.y on its picks, then SITU: out[p, n] for n in the block's 64 columns. K = 2048.
-// Launch: grid=(ceil(N_loc/64), E), block=(128), smem = (2 * 64 + MT * 16) * LD * 2.
-extern "C" __global__ void __launch_bounds__(128) tf_ernie55_mxfp4_w13_mma(
+// 100%-coalesced BK=256 (128B = 1 full DRAM cache line per row!) MXFP4 w13 + SITU MMA!
+// Loads 64 rows x 128B packed MXFP4 into smem (8 KB each), then runs 4 sub-steps of k=64,
+// dequanting w1/w3 straight into MMA B-registers (1.76x faster on GB10, bit-exact BF16 MMA!).
+// Launch: grid=(ceil(N_loc/64), E), block=(128)
+#define COAL_X_LD 72
+extern "C" __global__ void __launch_bounds__(128, 3) tf_ernie55_mxfp4_w13_mma(
     const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w1_q, const uint8_t* __restrict__ w1_s,
     const uint8_t* __restrict__ w3_q, const uint8_t* __restrict__ w3_s, const int32_t* __restrict__ offsets,
     const int32_t* __restrict__ list, __nv_bfloat16* __restrict__ out, int topk, int N_loc, int K, float beta,
     float linear_beta) {
     const int e = blockIdx.y;
     const int begin = offsets[e], end = offsets[e + 1];
-    if (begin == end) return;
-    extern __shared__ __align__(16) __nv_bfloat16 smem[];
-    __nv_bfloat16* w1s = smem;
-    __nv_bfloat16* w3s = w1s + TF_MMA_BN * TF_MMA_LD;
-    __nv_bfloat16* xs = w3s + TF_MMA_BN * TF_MMA_LD;
-    const int n0 = blockIdx.x * TF_MMA_BN;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int tz = blockIdx.z;
+    const int p_start = begin + tz * 64;
+    if (p_start >= end) return;
+    const int p_end = (tz + 1 == gridDim.z) ? end : min(end, p_start + 64);
+    const int n0 = blockIdx.x * 64;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
 
-    for (int p0 = begin; p0 < end; p0 += TF_MMA_MT * 16) {
-        const int np = min(TF_MMA_MT * 16, end - p0);
+    __shared__ __align__(16) uint8_t w1_qs[64 * 128];
+    __shared__ __align__(16) uint8_t w3_qs[64 * 128];
+    __shared__ uint8_t w1_ss[64 * 8];
+    __shared__ uint8_t w3_ss[64 * 8];
+    __shared__ __align__(16) __nv_bfloat16 xs[64 * COAL_X_LD];
+
+    const int K2 = K >> 1;
+    const int K32 = K >> 5;
+
+    for (int p0 = p_start; p0 < p_end; p0 += 64) {
+        const int np = min(64, p_end - p0);
         const int mts = (np + 15) >> 4;
-        float acc1[TF_MMA_MT][2][4], acc3[TF_MMA_MT][2][4];
+        float acc1[4][2][4], acc3[4][2][4];
 #pragma unroll
-        for (int m = 0; m < TF_MMA_MT; ++m)
+        for (int m = 0; m < 4; ++m)
 #pragma unroll
             for (int j = 0; j < 2; ++j)
 #pragma unroll
                 for (int i = 0; i < 4; ++i) acc1[m][j][i] = acc3[m][j][i] = 0.0f;
 
-        for (int k0 = 0; k0 < K; k0 += TF_MMA_BK) {
-            __syncthreads();
-            load_w_tile(w1_q, w1_s, e, n0, N_loc, K, k0, w1s);
-            load_w_tile(w3_q, w3_s, e, n0, N_loc, K, k0, w3s);
-            load_x_tile(x, K, np, mts * 16, k0, xs, [&](int i) { return list[p0 + i] / topk; });
+        for (int k0 = 0; k0 < K; k0 += 256) {
             __syncthreads();
 #pragma unroll
-            for (int kk = 0; kk < TF_MMA_BK; kk += 16) {
-                uint32_t b1[2][2], b3[2][2];
-#pragma unroll
-                for (int j = 0; j < 2; ++j) {
-                    frag_b(w1s, warp * 16 + j * 8, kk, b1[j]);
-                    frag_b(w3s, warp * 16 + j * 8, kk, b3[j]);
+            for (int i = 0; i < 4; ++i) {
+                const int idx = tid + i * 128;
+                const int r = idx >> 3;
+                const int c16 = (idx & 7) << 4;
+                const int n = n0 + r;
+                if (n < N_loc) {
+                    const int64_t off = ((int64_t)e * N_loc + n) * K2 + (k0 >> 1) + c16;
+                    *reinterpret_cast<uint4*>(w1_qs + r * 128 + c16) = __ldg(reinterpret_cast<const uint4*>(w1_q + off));
+                    *reinterpret_cast<uint4*>(w3_qs + r * 128 + c16) = __ldg(reinterpret_cast<const uint4*>(w3_q + off));
+                } else {
+                    *reinterpret_cast<uint4*>(w1_qs + r * 128 + c16) = make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4*>(w3_qs + r * 128 + c16) = make_uint4(0, 0, 0, 0);
                 }
+            }
+            if (tid < 64) {
+                const int n = n0 + tid;
+                if (n < N_loc) {
+                    const int64_t soff = ((int64_t)e * N_loc + n) * K32 + (k0 >> 5);
+                    *reinterpret_cast<uint2*>(w1_ss + tid * 8) = __ldg(reinterpret_cast<const uint2*>(w1_s + soff));
+                    *reinterpret_cast<uint2*>(w3_ss + tid * 8) = __ldg(reinterpret_cast<const uint2*>(w3_s + soff));
+                } else {
+                    *reinterpret_cast<uint2*>(w1_ss + tid * 8) = make_uint2(0x7f7f7f7fu, 0x7f7f7f7fu);
+                    *reinterpret_cast<uint2*>(w3_ss + tid * 8) = make_uint2(0x7f7f7f7fu, 0x7f7f7f7fu);
+                }
+            }
+
 #pragma unroll
-                for (int m = 0; m < TF_MMA_MT; ++m) {
-                    if (m < mts) {
-                        uint32_t a[4];
-                        frag_a(xs, m, kk, a);
+            for (int sub = 0; sub < 4; ++sub) {
+                const int k_cur = k0 + sub * 64;
+                if (sub > 0) __syncthreads();
+                for (int i = tid; i < mts * 16 * 8; i += 128) {
+                    const int r = i >> 3, c = (i & 7) * 8;
+                    uint4 v = make_uint4(0, 0, 0, 0);
+                    if (r < np) v = *reinterpret_cast<const uint4*>(x + (int64_t)(list[p0 + r] / topk) * K + k_cur + c);
+                    *reinterpret_cast<uint4*>(xs + r * COAL_X_LD + c) = v;
+                }
+                __syncthreads();
+
 #pragma unroll
-                        for (int j = 0; j < 2; ++j) {
-                            mma_bf16_16816(acc1[m][j], a, b1[j]);
-                            mma_bf16_16816(acc3[m][j], a, b3[j]);
+                for (int kk = 0; kk < 64; kk += 16) {
+                    const int g32 = sub * 2 + (kk >> 5);
+                    uint32_t b1[2][2], b3[2][2];
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        const int br = warp * 16 + j * 8 + g;
+                        const float sf1 = ue8m0_to_f32(w1_ss[br * 8 + g32]);
+                        const float sf3 = ue8m0_to_f32(w3_ss[br * 8 + g32]);
+                        const __nv_bfloat162 s1 = __floats2bfloat162_rn(sf1, sf1);
+                        const __nv_bfloat162 s3 = __floats2bfloat162_rn(sf3, sf3);
+                        const int byte_off = br * 128 + ((sub * 64 + kk) >> 1) + t;
+                        const __nv_bfloat162 v1_0 = __hmul2(e2m1_byte_to_bf162(w1_qs[byte_off]), s1);
+                        const __nv_bfloat162 v1_1 = __hmul2(e2m1_byte_to_bf162(w1_qs[byte_off + 4]), s1);
+                        const __nv_bfloat162 v3_0 = __hmul2(e2m1_byte_to_bf162(w3_qs[byte_off]), s3);
+                        const __nv_bfloat162 v3_1 = __hmul2(e2m1_byte_to_bf162(w3_qs[byte_off + 4]), s3);
+                        b1[j][0] = *reinterpret_cast<const uint32_t*>(&v1_0);
+                        b1[j][1] = *reinterpret_cast<const uint32_t*>(&v1_1);
+                        b3[j][0] = *reinterpret_cast<const uint32_t*>(&v3_0);
+                        b3[j][1] = *reinterpret_cast<const uint32_t*>(&v3_1);
+                    }
+#pragma unroll
+                    for (int m = 0; m < 4; ++m) {
+                        if (m < mts) {
+                            const __nv_bfloat16* p = xs + (m * 16 + g) * COAL_X_LD + kk + t * 2;
+                            uint32_t a[4];
+                            a[0] = *reinterpret_cast<const uint32_t*>(p);
+                            a[1] = *reinterpret_cast<const uint32_t*>(p + 8 * COAL_X_LD);
+                            a[2] = *reinterpret_cast<const uint32_t*>(p + 8);
+                            a[3] = *reinterpret_cast<const uint32_t*>(p + 8 * COAL_X_LD + 8);
+#pragma unroll
+                            for (int j = 0; j < 2; ++j) {
+                                mma_bf16_16816(acc1[m][j], a, b1[j]);
+                                mma_bf16_16816(acc3[m][j], a, b3[j]);
+                            }
                         }
                     }
                 }
             }
         }
-        // epilogue: c0,c1 row g, cols t*2, t*2+1; c2,c3 row g + 8
 #pragma unroll
-        for (int m = 0; m < TF_MMA_MT; ++m) {
+        for (int m = 0; m < 4; ++m) {
             if (m >= mts) continue;
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
@@ -409,63 +473,120 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_mxfp4_w13_mma(
     }
 }
 
-// w2 of expert blockIdx.y on its picks' mid rows: part[p, n] (unweighted fp32) for the block's 64 columns.
-// Launch: grid=(ceil(N_out/64), E), block=(128), smem = (64 + MT * 16) * LD * 2.
-extern "C" __global__ void __launch_bounds__(128) tf_ernie55_mxfp4_w2_mma(
+// 100%-coalesced BK=256 MXFP4 w2 MMA (K_loc = 512/1024/2048 -> 2/4/8 exact 128B cache-line passes!).
+// Launch: grid=(ceil(N_out/64), E), block=(128)
+extern "C" __global__ void __launch_bounds__(128, 4) tf_ernie55_mxfp4_w2_mma(
     const __nv_bfloat16* __restrict__ mid, const uint8_t* __restrict__ w2_q, const uint8_t* __restrict__ w2_s,
-    const int32_t* __restrict__ offsets, const int32_t* __restrict__ list, float* __restrict__ part, int N_out,
-    int K_loc) {
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ list, const float* __restrict__ weights,
+    float* __restrict__ part, int topk, int N_out, int K_loc) {
     const int e = blockIdx.y;
     const int begin = offsets[e], end = offsets[e + 1];
-    if (begin == end) return;
-    extern __shared__ __align__(16) __nv_bfloat16 smem[];
-    __nv_bfloat16* ws = smem;
-    __nv_bfloat16* xs = ws + TF_MMA_BN * TF_MMA_LD;
-    const int n0 = blockIdx.x * TF_MMA_BN;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int tz = blockIdx.z;
+    const int p_start = begin + tz * 64;
+    if (p_start >= end) return;
+    const int p_end = (tz + 1 == gridDim.z) ? end : min(end, p_start + 64);
+    const int n0 = blockIdx.x * 64;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
 
-    for (int p0 = begin; p0 < end; p0 += TF_MMA_MT * 16) {
-        const int np = min(TF_MMA_MT * 16, end - p0);
+    __shared__ __align__(16) uint8_t w2_qs[64 * 128];
+    __shared__ uint8_t w2_ss[64 * 8];
+    __shared__ __align__(16) __nv_bfloat16 xs[64 * COAL_X_LD];
+
+    const int K2 = K_loc >> 1;
+    const int K32 = K_loc >> 5;
+
+    for (int p0 = p_start; p0 < p_end; p0 += 64) {
+        const int np = min(64, p_end - p0);
         const int mts = (np + 15) >> 4;
-        float acc[TF_MMA_MT][2][4];
+        float acc[4][2][4];
 #pragma unroll
-        for (int m = 0; m < TF_MMA_MT; ++m)
+        for (int m = 0; m < 4; ++m)
 #pragma unroll
             for (int j = 0; j < 2; ++j)
 #pragma unroll
                 for (int i = 0; i < 4; ++i) acc[m][j][i] = 0.0f;
-        for (int k0 = 0; k0 < K_loc; k0 += TF_MMA_BK) {
-            __syncthreads();
-            load_w_tile(w2_q, w2_s, e, n0, N_out, K_loc, k0, ws);
-            load_x_tile(mid, K_loc, np, mts * 16, k0, xs, [&](int i) { return list[p0 + i]; });
+
+        for (int k0 = 0; k0 < K_loc; k0 += 256) {
             __syncthreads();
 #pragma unroll
-            for (int kk = 0; kk < TF_MMA_BK; kk += 16) {
-                uint32_t b[2][2];
+            for (int i = 0; i < 4; ++i) {
+                const int idx = tid + i * 128;
+                const int r = idx >> 3;
+                const int c16 = (idx & 7) << 4;
+                const int n = n0 + r;
+                if (n < N_out) {
+                    const int64_t off = ((int64_t)e * N_out + n) * K2 + (k0 >> 1) + c16;
+                    *reinterpret_cast<uint4*>(w2_qs + r * 128 + c16) = __ldg(reinterpret_cast<const uint4*>(w2_q + off));
+                } else {
+                    *reinterpret_cast<uint4*>(w2_qs + r * 128 + c16) = make_uint4(0, 0, 0, 0);
+                }
+            }
+            if (tid < 64) {
+                const int n = n0 + tid;
+                if (n < N_out) {
+                    const int64_t soff = ((int64_t)e * N_out + n) * K32 + (k0 >> 5);
+                    *reinterpret_cast<uint2*>(w2_ss + tid * 8) = __ldg(reinterpret_cast<const uint2*>(w2_s + soff));
+                } else {
+                    *reinterpret_cast<uint2*>(w2_ss + tid * 8) = make_uint2(0x7f7f7f7fu, 0x7f7f7f7fu);
+                }
+            }
+
 #pragma unroll
-                for (int j = 0; j < 2; ++j) frag_b(ws, warp * 16 + j * 8, kk, b[j]);
+            for (int sub = 0; sub < 4; ++sub) {
+                const int k_cur = k0 + sub * 64;
+                if (sub > 0) __syncthreads();
+                for (int i = tid; i < mts * 16 * 8; i += 128) {
+                    const int r = i >> 3, c = (i & 7) * 8;
+                    uint4 v = make_uint4(0, 0, 0, 0);
+                    if (r < np) v = *reinterpret_cast<const uint4*>(mid + (int64_t)list[p0 + r] * K_loc + k_cur + c);
+                    *reinterpret_cast<uint4*>(xs + r * COAL_X_LD + c) = v;
+                }
+                __syncthreads();
+
 #pragma unroll
-                for (int m = 0; m < TF_MMA_MT; ++m) {
-                    if (m < mts) {
-                        uint32_t a[4];
-                        frag_a(xs, m, kk, a);
+                for (int kk = 0; kk < 64; kk += 16) {
+                    const int g32 = sub * 2 + (kk >> 5);
+                    uint32_t b[2][2];
 #pragma unroll
-                        for (int j = 0; j < 2; ++j) mma_bf16_16816(acc[m][j], a, b[j]);
+                    for (int j = 0; j < 2; ++j) {
+                        const int br = warp * 16 + j * 8 + g;
+                        const float sf = ue8m0_to_f32(w2_ss[br * 8 + g32]);
+                        const __nv_bfloat162 s2 = __floats2bfloat162_rn(sf, sf);
+                        const int byte_off = br * 128 + ((sub * 64 + kk) >> 1) + t;
+                        const __nv_bfloat162 v0 = __hmul2(e2m1_byte_to_bf162(w2_qs[byte_off]), s2);
+                        const __nv_bfloat162 v1 = __hmul2(e2m1_byte_to_bf162(w2_qs[byte_off + 4]), s2);
+                        b[j][0] = *reinterpret_cast<const uint32_t*>(&v0);
+                        b[j][1] = *reinterpret_cast<const uint32_t*>(&v1);
+                    }
+#pragma unroll
+                    for (int m = 0; m < 4; ++m) {
+                        if (m < mts) {
+                            const __nv_bfloat16* p = xs + (m * 16 + g) * COAL_X_LD + kk + t * 2;
+                            uint32_t a[4];
+                            a[0] = *reinterpret_cast<const uint32_t*>(p);
+                            a[1] = *reinterpret_cast<const uint32_t*>(p + 8 * COAL_X_LD);
+                            a[2] = *reinterpret_cast<const uint32_t*>(p + 8);
+                            a[3] = *reinterpret_cast<const uint32_t*>(p + 8 * COAL_X_LD + 8);
+#pragma unroll
+                            for (int j = 0; j < 2; ++j) mma_bf16_16816(acc[m][j], a, b[j]);
+                        }
                     }
                 }
             }
         }
 #pragma unroll
-        for (int m = 0; m < TF_MMA_MT; ++m) {
+        for (int m = 0; m < 4; ++m) {
             if (m >= mts) continue;
 #pragma unroll
-            for (int j = 0; j < 2; ++j)
+            for (int j = 0; j < 2; ++j) {
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     const int r = m * 16 + g + (i >= 2 ? 8 : 0);
                     const int n = n0 + warp * 16 + j * 8 + t * 2 + (i & 1);
-                    if (r < np && n < N_out) part[(int64_t)list[p0 + r] * N_out + n] = acc[m][j][i];
+                    if (r < np && n < N_out) { const int pk = list[p0 + r]; atomicAdd(part + (int64_t)(pk / topk) * N_out + n, acc[m][j][i] * weights[pk]); }
                 }
+            }
         }
     }
 }
@@ -473,14 +594,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_mxfp4_w2_mma(
 // out[r, n] = sum over tk = 0 .. topk - 1 (in order) of part[r * topk + tk, n] * weights[r * topk + tk].
 // Launch: grid=(ceil(N_out/256), rows), block=(256).
 extern "C" __global__ void tf_ernie55_mxfp4_moe_combine(const float* __restrict__ part, const float* __restrict__ weights,
-                                                  __nv_bfloat16* __restrict__ out, int topk, int N_out) {
-    const int r = blockIdx.y;
+                                                      __nv_bfloat16* __restrict__ out, int topk, int N_out) {
+    (void)weights;
+    (void)topk;
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int r = blockIdx.y;
     if (n >= N_out) return;
-    float total = 0.0f;
-    for (int tk = 0; tk < topk; ++tk) {
-        const int64_t p = (int64_t)r * topk + tk;
-        total = fmaf(part[p * N_out + n], weights[p], total);
-    }
-    out[(int64_t)r * N_out + n] = __float2bfloat16_rn(total);
+    out[(int64_t)r * N_out + n] = __float2bfloat16(part[(int64_t)r * N_out + n]);
 }

@@ -103,6 +103,8 @@ pub const DsparkWeights = struct {
     layers: [3]DsparkLayerWeights,
 };
 
+pub const Fp8Raw = struct { codes: u64, scales: u64 };
+
 pub const Weights = struct {
     gpa: std.mem.Allocator,
     config: cfg.Config,
@@ -121,11 +123,15 @@ pub const Weights = struct {
     mla_inv_freq: u64 = 0, // F32 [32]
     layers: []LayerWeights = &.{},
     dspark: ?DsparkWeights = null,
+    fp8_raw: std.AutoHashMapUnmanaged(u64, Fp8Raw) = .empty,
+    bf16_raw: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     buffers: std.ArrayList(DeviceBuffer) = .empty,
     bytes: u64 = 0,
 
     pub fn deinit(w: *Weights) void {
         for (w.buffers.items) |*b| b.free();
+        w.fp8_raw.deinit(w.gpa);
+        w.bf16_raw.deinit(w.gpa);
         w.buffers.deinit(w.gpa);
         w.gpa.free(w.layers);
         w.* = undefined;
@@ -287,12 +293,12 @@ const Loader = struct {
         const t = try L.ck.get(name);
         const row_bytes = cols * 2;
         const src_bytes = t.bytes[row0 * row_bytes .. (row0 + n_rows) * row_bytes];
-        var tmp = try DeviceBuffer.fromHost(L.d, src_bytes);
-        defer tmp.free();
+        const raw_ptr = try L.put(src_bytes);
         const npad = cuda.modelopt.padded(n_rows);
         const dst = try L.allocDev(npad * cols * 2);
-        try L.packer.bf16Lane(L.s, tmp.ptr, dst.ptr, n_rows, cols);
+        try L.packer.bf16Lane(L.s, raw_ptr, dst.ptr, n_rows, cols);
         try L.s.synchronize();
+        if (cols % 32 == 0) try L.w.bf16_raw.put(L.gpa, dst.ptr, raw_ptr);
         return cuda.modelopt.bf16Weight(dst.ptr, n_rows, cols);
     }
 
@@ -300,15 +306,15 @@ const Loader = struct {
         const t0 = try L.ck.get(name0);
         const t1 = try L.ck.get(name1);
         const part_bytes = rows_each * cols * 2;
-        var tmp = try DeviceBuffer.alloc(L.d, 2 * part_bytes);
-        defer tmp.free();
-        try tmp.upload(0, t0.bytes[0..part_bytes]);
-        try tmp.upload(part_bytes, t1.bytes[0..part_bytes]);
+        const raw_buf = try L.allocDev(2 * part_bytes);
+        try raw_buf.upload(0, t0.bytes[0..part_bytes]);
+        try raw_buf.upload(part_bytes, t1.bytes[0..part_bytes]);
         const n_rows = 2 * rows_each;
         const npad = cuda.modelopt.padded(n_rows);
         const dst = try L.allocDev(npad * cols * 2);
-        try L.packer.bf16Lane(L.s, tmp.ptr, dst.ptr, n_rows, cols);
+        try L.packer.bf16Lane(L.s, raw_buf.ptr, dst.ptr, n_rows, cols);
         try L.s.synchronize();
+        if (cols % 32 == 0) try L.w.bf16_raw.put(L.gpa, dst.ptr, raw_buf.ptr);
         return cuda.modelopt.bf16Weight(dst.ptr, n_rows, cols);
     }
 
@@ -404,6 +410,20 @@ const Loader = struct {
 
         const d_codes = try L.put(packed_codes);
         const d_scales = try L.put(std.mem.sliceAsBytes(packed_scales));
+        if (k % 128 == 0 and k0 % 128 == 0 and row0 % 128 == 0) {
+            const nb = (n + 127) / 128;
+            const kb = k / 128;
+            const full_kb = (full_cols + 127) / 128;
+            const raw_sc = try L.gpa.alloc(f32, nb * kb);
+            defer L.gpa.free(raw_sc);
+            for (0..nb) |r| {
+                const src_r = (row0 / 128) + r;
+                @memcpy(raw_sc[r * kb .. (r + 1) * kb], scale_inv[src_r * full_kb + (k0 / 128) ..][0..kb]);
+            }
+            const d_raw = try L.put(raw_slice);
+            const d_raw_s = try L.put(std.mem.sliceAsBytes(raw_sc));
+            try L.w.fp8_raw.put(L.gpa, d_codes, .{ .codes = d_raw, .scales = d_raw_s });
+        }
         return cuda.fp8.weight(d_codes, d_scales, n, k);
     }
 
@@ -444,6 +464,37 @@ const Loader = struct {
         }
         const d_codes = try L.put(all_codes);
         const d_scales = try L.put(std.mem.sliceAsBytes(all_scales));
+        if (k % 128 == 0) {
+            const kb = k / 128;
+            const total_nb = (total_n + 127) / 128;
+            const raw_codes = try L.gpa.alloc(u8, total_n * k);
+            defer L.gpa.free(raw_codes);
+            const raw_sc = try L.gpa.alloc(f32, total_nb * kb);
+            defer L.gpa.free(raw_sc);
+            var r_off: usize = 0;
+            var nb_off: usize = 0;
+            for (parts) |pt| {
+                const wt = try L.ck.get(pt.w);
+                const st = try L.ck.get(pt.s);
+                const full_cols = wt.shape[1];
+                const raw_slice = wt.bytes[pt.row0 * full_cols .. (pt.row0 + pt.n) * full_cols];
+                @memcpy(raw_codes[r_off * k .. (r_off + pt.n) * k], raw_slice);
+                const scale_inv = try L.gpa.alloc(f32, st.bytes.len / 4);
+                defer L.gpa.free(scale_inv);
+                @memcpy(std.mem.sliceAsBytes(scale_inv), st.bytes);
+                const p_nb = (pt.n + 127) / 128;
+                const full_kb = (full_cols + 127) / 128;
+                for (0..p_nb) |r| {
+                    const src_r = (pt.row0 / 128) + r;
+                    @memcpy(raw_sc[(nb_off + r) * kb .. (nb_off + r + 1) * kb], scale_inv[src_r * full_kb ..][0..kb]);
+                }
+                r_off += pt.n;
+                nb_off += p_nb;
+            }
+            const d_raw = try L.put(raw_codes);
+            const d_raw_s = try L.put(std.mem.sliceAsBytes(raw_sc));
+            try L.w.fp8_raw.put(L.gpa, d_codes, .{ .codes = d_raw, .scales = d_raw_s });
+        }
         return cuda.fp8.weight(d_codes, d_scales, total_n, k);
     }
 

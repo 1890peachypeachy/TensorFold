@@ -6,6 +6,7 @@
 //   - Expanded V [rows, H_loc, 256] = o_lat @ wv^T
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -926,6 +927,164 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_attn_mma(
             o0[dn + 1] = acc[j][1];
             o1[dn]     = acc[j][2];
             o1[dn + 1] = acc[j][3];
+        }
+    }
+}
+
+
+// 4-row-tiled SM121a FP8 m16n8k32 DSA Lightning Indexer for prefill (rows >= 4):
+// Loads ks[64, 128] ONCE per 4 query rows (4x less DRAM traffic on idx_k at 70K+ context!)
+// and runs mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 (2x Tensor Core throughput!).
+// Launch: grid=(ceil(max_older / 64), ceil(rows / 4)), block=(128)
+#define TF_IDX_FP8_LD 144
+__device__ __forceinline__ void idx_mma16832_fp8(float* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_indexer_scores_fp8_mma(
+    const __nv_bfloat16* __restrict__ q_idx,    // [rows, 64, 128]
+    const __nv_bfloat16* __restrict__ idx_k,    // [capacity, 128]
+    const __nv_bfloat16* __restrict__ weights,  // [rows, 64]
+    const int32_t* __restrict__ positions,      // [rows]
+    float* __restrict__ scores,                 // [rows, max_older]
+    int rows, int max_older, int window_size, float weights_scale) {
+    const int r0 = blockIdx.y * 4;
+    const int t0 = blockIdx.x * 64;
+    if (r0 >= rows || t0 >= max_older) return;
+    const int nr = (rows - r0 < 4) ? (rows - r0) : 4;
+
+    int max_n_older = 0;
+    for (int dr = 0; dr < nr; ++dr) {
+        int no = positions[r0 + dr] - window_size + 1;
+        if (no > max_n_older) max_n_older = no;
+    }
+    if (t0 >= max_n_older) {
+        for (int dr = 0; dr < nr; ++dr) {
+            for (int i = threadIdx.x; i < 64; i += blockDim.x) {
+                if (t0 + i < max_older) scores[(int64_t)(r0 + dr) * max_older + t0 + i] = -1e38f;
+            }
+        }
+        return;
+    }
+
+    __shared__ __align__(16) uint8_t ks[64 * TF_IDX_FP8_LD];
+    __shared__ __align__(16) uint8_t qs[64 * TF_IDX_FP8_LD];
+    __shared__ float k_sc[64];
+    __shared__ float q_sc[64];
+    __shared__ float red[4 * 64];
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int tq = lane & 3;
+
+    // 1. Load & quantize ks[64, 128] ONCE (4 warps x 16 rows each, 1 warp = 1 row -> 4 elems/lane!)
+    for (int row = warp; row < 64; row += 4) {
+        int t = t0 + row;
+        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+        if (t < max_n_older) {
+            uint2 raw = *reinterpret_cast<const uint2*>(idx_k + (int64_t)t * 128 + lane * 4);
+            const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            v0 = __bfloat162float(b[0]); v1 = __bfloat162float(b[1]);
+            v2 = __bfloat162float(b[2]); v3 = __bfloat162float(b[3]);
+        }
+        float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+        float sc = fmaxf(amax, 1e-12f) * (1.0f / 448.0f);
+        float inv = 1.0f / sc;
+        if (lane == 0) k_sc[row] = sc;
+        uint8_t q[4];
+        q[0] = __nv_fp8_e4m3(v0 * inv).__x;
+        q[1] = __nv_fp8_e4m3(v1 * inv).__x;
+        q[2] = __nv_fp8_e4m3(v2 * inv).__x;
+        q[3] = __nv_fp8_e4m3(v3 * inv).__x;
+        *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + lane * 4) = *reinterpret_cast<uint32_t*>(q);
+    }
+
+    // 2. Loop over the 4 query rows sharing ks!
+    for (int dr = 0; dr < nr; ++dr) {
+        const int r = r0 + dr;
+        const int n_older = positions[r] - window_size + 1;
+        if (t0 >= n_older) {
+            for (int i = tid; i < 64; i += blockDim.x) {
+                if (t0 + i < max_older) scores[(int64_t)r * max_older + t0 + i] = -1e38f;
+            }
+            continue;
+        }
+        __syncthreads();
+        const __nv_bfloat16* qr = q_idx + (int64_t)r * 64 * 128;
+        for (int h = warp; h < 64; h += 4) {
+            uint2 raw = *reinterpret_cast<const uint2*>(qr + (int64_t)h * 128 + lane * 4);
+            const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            float v0 = __bfloat162float(b[0]), v1 = __bfloat162float(b[1]);
+            float v2 = __bfloat162float(b[2]), v3 = __bfloat162float(b[3]);
+            float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+            float sc = fmaxf(amax, 1e-12f) * (1.0f / 448.0f);
+            float inv = 1.0f / sc;
+            if (lane == 0) q_sc[h] = sc;
+            uint8_t q[4];
+            q[0] = __nv_fp8_e4m3(v0 * inv).__x;
+            q[1] = __nv_fp8_e4m3(v1 * inv).__x;
+            q[2] = __nv_fp8_e4m3(v2 * inv).__x;
+            q[3] = __nv_fp8_e4m3(v3 * inv).__x;
+            *reinterpret_cast<uint32_t*>(qs + h * TF_IDX_FP8_LD + lane * 4) = *reinterpret_cast<uint32_t*>(q);
+        }
+        __syncthreads();
+
+        float acc[8][4];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[j][i] = 0.0f;
+
+        #pragma unroll
+        for (int kk = 0; kk < 128; kk += 32) {
+            uint32_t a[4];
+            const uint8_t* ap = qs + (warp * 16 + g) * TF_IDX_FP8_LD + kk + tq * 4;
+            a[0] = *reinterpret_cast<const uint32_t*>(ap);
+            a[1] = *reinterpret_cast<const uint32_t*>(ap + 8 * TF_IDX_FP8_LD);
+            a[2] = *reinterpret_cast<const uint32_t*>(ap + 16);
+            a[3] = *reinterpret_cast<const uint32_t*>(ap + 8 * TF_IDX_FP8_LD + 16);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                uint32_t b[2];
+                const uint8_t* bp = ks + (j * 8 + g) * TF_IDX_FP8_LD + kk + tq * 4;
+                b[0] = *reinterpret_cast<const uint32_t*>(bp);
+                b[1] = *reinterpret_cast<const uint32_t*>(bp + 16);
+                idx_mma16832_fp8(acc[j], a, b);
+            }
+        }
+
+        const int h_lo = warp * 16 + g;
+        const int h_hi = h_lo + 8;
+        const float w_lo = __bfloat162float(weights[(int64_t)r * 64 + h_lo]) * weights_scale * q_sc[h_lo];
+        const float w_hi = __bfloat162float(weights[(int64_t)r * 64 + h_hi]) * weights_scale * q_sc[h_hi];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            #pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int col = j * 8 + tq * 2 + e;
+                const float ks_c = k_sc[col];
+                float v = (w_lo * fmaxf(acc[j][e], 0.0f) + w_hi * fmaxf(acc[j][e + 2], 0.0f)) * ks_c;
+                v += __shfl_xor_sync(0xffffffffu, v, 4);
+                v += __shfl_xor_sync(0xffffffffu, v, 8);
+                v += __shfl_xor_sync(0xffffffffu, v, 16);
+                if (g == 0) red[warp * 64 + col] = v;
+            }
+        }
+        __syncthreads();
+        for (int i = tid; i < 64; i += blockDim.x) {
+            const int t = t0 + i;
+            if (t >= max_older) continue;
+            const float total = red[i] + red[64 + i] + red[128 + i] + red[192 + i];
+            scores[(int64_t)r * max_older + t] = (t < n_older) ? total : -1e38f;
         }
     }
 }

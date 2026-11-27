@@ -67,6 +67,22 @@ pub const Runner = struct {
     }
 
     pub fn fp8(self: *const Runner, s: Stream, x: u64, ldx: usize, rows: usize, w: cuda.qmmf.Weight, y: u64, part: u64) !void {
+        if (rows >= 32 and w.mode == .bf16 and ldx == w.k and w.k % 32 == 0) {
+            if (self.w.bf16_raw.get(w.codes)) |raw_w| {
+                try self.k.bf16GemmBf16Mma(s, x, raw_w, y, rows, w.n, w.k);
+                return;
+            }
+        }
+        if (rows >= 64 and w.k % 128 == 0) {
+            if (self.w.fp8_raw.get(w.codes)) |raw| {
+                const q_bytes = ((rows * @as(usize, w.k)) + 255) & ~@as(usize, 255);
+                const xq = part;
+                const sx = part + q_bytes;
+                try self.k.quantBf16ToFp8B128(s, x, ldx, xq, sx, rows, w.k);
+                try self.k.fp8GemmB128Mma(s, xq, sx, raw.codes, raw.scales, y, rows, w.n, w.k);
+                return;
+            }
+        }
         if (rows <= decode_rows and w.sk == 0) {
             var wd = w;
             wd.sk = decodeSlices(w.n, w.k);
@@ -76,6 +92,12 @@ pub const Runner = struct {
     }
 
     pub fn bf16F32(self: *const Runner, s: Stream, x: u64, ldx: usize, rows: usize, w: cuda.qmmf.Weight, y: u64, part: u64) !void {
+        if (rows >= 32 and ldx == w.k and w.k % 32 == 0) {
+            if (self.w.bf16_raw.get(w.codes)) |raw_w| {
+                try self.k.bf16GemmF32Mma(s, x, raw_w, y, rows, w.n, w.k);
+                return;
+            }
+        }
         if (rows <= decode_rows and w.sk == 0) {
             var wd = w;
             wd.sk = decodeSlices(w.n, w.k);
@@ -329,7 +351,9 @@ pub const Runner = struct {
             const lkv = &g.kv.layers[li].hca;
             const comp_ptr = if (hca.comp_wkv_wgate != null) lkv.comp_kv else 0;
             const head_rows = g.row0 * sh.heads * 512 * 2;
-            if (sh.heads == 16) {
+            if (sh.heads == 16 and g.n >= 16) {
+                try k.hcaAttnPrefillMma(s, sc.q_up + head_rows, lkv.swa_kv, comp_ptr, hca.attn_sink, sc.positions + g.row0 * 4, sc.attn_o + head_rows, g.n, kv_mod.swa_mask, c.sliding_window, scale);
+            } else if (sh.heads == 16) {
                 try k.hcaAttnMma(s, sc.q_up + head_rows, lkv.swa_kv, comp_ptr, hca.attn_sink, sc.positions + g.row0 * 4, sc.attn_o + head_rows, sc.attn_split_o, sc.attn_split_m, sc.attn_split_l, g.n, kv_mod.swa_mask, c.sliding_window, attnSplits(g.n, 8), scale);
             } else {
                 try k.hcaAttn(s, sc.q_up + head_rows, lkv.swa_kv, comp_ptr, hca.attn_sink, sc.positions + g.row0 * 4, sc.attn_o + head_rows, g.n, sh.heads, kv_mod.swa_mask, c.sliding_window, scale);

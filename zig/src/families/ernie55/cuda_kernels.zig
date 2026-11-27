@@ -65,6 +65,10 @@ pub const Kernels = struct {
     argmax_pair16: Function,
     pick_merge_batch: Function,
     lm_head_bf16: Function,
+    quant_bf16_to_fp8_b128: Function,
+    fp8_gemm_b128_mma: Function,
+    bf16_gemm_bf16_mma: Function,
+    bf16_gemm_f32_mma: Function,
     vha_u_proj_bf16: Function,
     vha_v_add_bf16: Function,
     mhc_pre_mma: Function,
@@ -81,6 +85,7 @@ pub const Kernels = struct {
     mxfp4_w2_mma: Function,
     mxfp4_moe_combine: Function,
     dsa_indexer_scores_mma: Function,
+    dsa_indexer_scores_fp8_mma: Function,
     dsa_absorb_q_mma: Function,
     dsa_rope_copy: Function,
     dsa_expand_v_mma: Function,
@@ -96,6 +101,7 @@ pub const Kernels = struct {
     hca_qkv_prep: Function,
     hca_comp_save_packed: Function,
     hca_attn_mma: Function,
+    hca_attn_prefill_mma: Function,
     hca_attn_dspark_mma: Function,
     attn_splitk_combine: Function,
 
@@ -146,6 +152,7 @@ pub const Kernels = struct {
         try k.mhc_contract_norm.allowDynamicShared(48 * 1024);
         try k.mxfp4_w2_combine.allowDynamicShared(48 * 1024);
         try k.hca_attn_mma.allowDynamicShared(54 * 1024);
+        try k.hca_attn_prefill_mma.allowDynamicShared(92 * 1024);
         try k.hca_attn_dspark_mma.allowDynamicShared(54 * 1024);
         try k.dsa_attn_mma.allowDynamicShared(60 * 1024);
         return k;
@@ -331,7 +338,6 @@ pub const Kernels = struct {
     /// w13 + SITU into `mid`, w2 into `part` (fp32 per pick), then the in-order top-k combine into `out`.
     pub fn moeGrouped(k: *const Kernels, s: Stream, x: u64, w1_q: u64, w1_s: u64, w3_q: u64, w3_s: u64, w2_q: u64, w2_s: u64, ids: u64, weights: u64, counts: u64, offsets: u64, cursor: u64, list: u64, mid: u64, part: u64, out: u64, rows: usize, topk: usize, experts: usize, n_loc: usize, k_dim: usize, n_out: usize, k_loc: usize, beta: f32, linear_beta: f32) !void {
         const pairs = rows * topk;
-        const ld: usize = 64 + 8; // TF_MMA_LD
         {
             var a: cuda.Args = .{};
             inline for (.{ counts, ci(experts) }) |v| a.add(v);
@@ -352,15 +358,17 @@ pub const Kernels = struct {
             inline for (.{ ids, ci(pairs), cursor, list }) |v| a.add(v);
             try cuda.launch.launch(k.mxfp4_route_fill, .{ .grid = .{ .x = cdiv(pairs, 256) }, .block = .{ .x = 256 } }, s, &a);
         }
+        const gz: u32 = if (rows >= 256) @min(@as(u32, 8), @as(u32, @intCast((pairs + experts * 64 - 1) / (experts * 64) + 3))) else 1;
         {
             var a: cuda.Args = .{};
             inline for (.{ x, w1_q, w1_s, w3_q, w3_s, offsets, list, mid, ci(topk), ci(n_loc), ci(k_dim), beta, linear_beta }) |v| a.add(v);
-            try cuda.launch.launch(k.mxfp4_w13_mma, .{ .grid = .{ .x = cdiv(n_loc, 64), .y = @intCast(experts) }, .block = .{ .x = 128 }, .shared = @intCast((2 * 64 + 64) * ld * 2) }, s, &a);
+            try cuda.launch.launch(k.mxfp4_w13_mma, .{ .grid = .{ .x = cdiv(n_loc, 64), .y = @intCast(experts), .z = gz }, .block = .{ .x = 128 }, .shared = 0 }, s, &a);
         }
+        try s.d.check(s.d.api.cuMemsetD32Async(part, 0, rows * n_out, s.handle), "cuMemsetD32Async");
         {
             var a: cuda.Args = .{};
-            inline for (.{ mid, w2_q, w2_s, offsets, list, part, ci(n_out), ci(k_loc) }) |v| a.add(v);
-            try cuda.launch.launch(k.mxfp4_w2_mma, .{ .grid = .{ .x = cdiv(n_out, 64), .y = @intCast(experts) }, .block = .{ .x = 128 }, .shared = @intCast((64 + 64) * ld * 2) }, s, &a);
+            inline for (.{ mid, w2_q, w2_s, offsets, list, weights, part, ci(topk), ci(n_out), ci(k_loc) }) |v| a.add(v);
+            try cuda.launch.launch(k.mxfp4_w2_mma, .{ .grid = .{ .x = cdiv(n_out, 64), .y = @intCast(experts), .z = gz }, .block = .{ .x = 128 }, .shared = 0 }, s, &a);
         }
         {
             var a: cuda.Args = .{};
@@ -437,6 +445,10 @@ pub const Kernels = struct {
     pub fn dsaIndexerScoresMma(k: *const Kernels, s: Stream, q_idx: u64, idx_k: u64, weights: u64, positions: u64, scores: u64, rows: usize, max_older: usize, window: usize, w_scale: f32) !void {
         var a: cuda.Args = .{};
         inline for (.{ q_idx, idx_k, weights, positions, scores, ci(rows), ci(max_older), ci(window), w_scale }) |v| a.add(v);
+        if (rows >= 4) {
+            try cuda.launch.launch(k.dsa_indexer_scores_fp8_mma, .{ .grid = .{ .x = cdiv(max_older, 64), .y = cdiv(rows, 4) }, .block = .{ .x = 128 } }, s, &a);
+            return;
+        }
         try cuda.launch.launch(k.dsa_indexer_scores_mma, .{ .grid = .{ .x = cdiv(max_older, 64), .y = @intCast(rows) }, .block = .{ .x = 128 }, .shared = 128 * 136 * 2 + 4 * 64 * 4 }, s, &a);
     }
 
@@ -548,6 +560,13 @@ pub const Kernels = struct {
         try cuda.launch.launch(k.dsa_qkv_prep, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
     }
 
+    pub fn hcaAttnPrefillMma(k: *const Kernels, s: Stream, q: u64, swa_kv: u64, comp_kv: u64, sink: u64, positions: u64, out: u64, rows: usize, swa_mask: usize, window_size: usize, scale: f32) !void {
+        const smem: u32 = (4 * 16 * 520 + 16 * 520) * 2 + 4 * 16 * 16 * 6 + 4 * 16 * 12;
+        var a: cuda.Args = .{};
+        inline for (.{ q, swa_kv, comp_kv, sink, positions, out, ci(rows), ci(swa_mask), ci(window_size), scale }) |v| a.add(v);
+        try cuda.launch.launch(k.hca_attn_prefill_mma, .{ .grid = .{ .x = cdiv(rows, 4) }, .block = .{ .x = 512 }, .shared = smem }, s, &a);
+    }
+
     pub fn hcaAttnMma(k: *const Kernels, s: Stream, q: u64, swa_kv: u64, comp_kv: u64, sink: u64, positions: u64, out: u64, opart: u64, mpart: u64, lpart: u64, rows: usize, swa_mask: usize, window_size: usize, splits: usize, scale: f32) !void {
         const smem: u32 = (16 * 520 + 32 * 520) * 2 + 16 * 32 * 4 + 16 * 32 * 2 + 192;
         var a: cuda.Args = .{};
@@ -623,5 +642,29 @@ pub const Kernels = struct {
         var a: cuda.Args = .{};
         inline for (.{ o, v_mat, z, ci(rows), ci(h_loc), ci(head_dim) }) |v| a.add(v);
         try cuda.launch.launch(k.vha_v_add_bf16, .{ .grid = .{ .x = cdiv(head_dim, 32), .y = @intCast(rows) }, .block = .{ .x = 32, .y = @intCast(@min(h_loc, 16)) } }, s, &a);
+    }
+
+    pub fn quantBf16ToFp8B128(k: *const Kernels, s: Stream, x: u64, ldx: usize, out_q: u64, out_s: u64, m: usize, k_dim: usize) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ x, ci(ldx), out_q, out_s, ci(m), ci(k_dim) }) |v| a.add(v);
+        try cuda.launch.launch(k.quant_bf16_to_fp8_b128, .{ .grid = .{ .x = @intCast(k_dim / 128), .y = @intCast(m) }, .block = .{ .x = 32 } }, s, &a);
+    }
+
+    pub fn fp8GemmB128Mma(k: *const Kernels, s: Stream, xq: u64, sx: u64, wq: u64, sw: u64, y: u64, m: usize, n: usize, k_dim: usize) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ xq, sx, wq, sw, y, ci(m), ci(n), ci(k_dim) }) |v| a.add(v);
+        try cuda.launch.launch(k.fp8_gemm_b128_mma, .{ .grid = .{ .x = cdiv(n, 128), .y = cdiv(m, 64) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn bf16GemmBf16Mma(k: *const Kernels, s: Stream, x: u64, w: u64, y: u64, m: usize, n: usize, k_dim: usize) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ x, w, y, ci(m), ci(n), ci(k_dim) }) |v| a.add(v);
+        try cuda.launch.launch(k.bf16_gemm_bf16_mma, .{ .grid = .{ .x = cdiv(n, 64), .y = cdiv(m, 64) }, .block = .{ .x = 128 } }, s, &a);
+    }
+
+    pub fn bf16GemmF32Mma(k: *const Kernels, s: Stream, x: u64, w: u64, y: u64, m: usize, n: usize, k_dim: usize) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ x, w, y, ci(m), ci(n), ci(k_dim) }) |v| a.add(v);
+        try cuda.launch.launch(k.bf16_gemm_f32_mma, .{ .grid = .{ .x = cdiv(n, 64), .y = cdiv(m, 64) }, .block = .{ .x = 128 } }, s, &a);
     }
 };

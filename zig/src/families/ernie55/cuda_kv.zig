@@ -8,7 +8,7 @@ const Driver = cuda.Driver;
 const DeviceBuffer = cuda.DeviceBuffer;
 
 /// Ring capacity for HCA SWA-128 KV cache and C128 compressor state (power of 2 >= max_chunk + 128).
-pub const swa_cap: usize = 2048; // >= the 1024-row prompt chunk + 128
+pub const swa_cap: usize = 8192; // >= the 1024-row prompt chunk + 128
 pub const swa_mask: usize = swa_cap - 1;
 
 pub const HcaKv = struct {
