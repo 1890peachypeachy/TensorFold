@@ -115,7 +115,11 @@ pub const Drafter = struct {
         for (0..take) |i| pos_host[i] = @intCast(start_pos + i);
         try cuda.copy_source.enqueue(self.d, sc.positions, std.mem.sliceAsBytes(pos_host[0..take]), s);
 
-        try runner.fp8(s, taps_ptr, 3 * c.hidden, take, self.w.feature_proj, sc.layer_in, sc.qmmf_part);
+        const full_k = 3 * c.hidden;
+        const k_w = self.w.feature_proj.k;
+        const k0: usize = if (k_w < full_k) runner.w.share.rank * k_w else 0;
+        try runner.fp8(s, taps_ptr + k0 * 2, full_k, take, self.w.feature_proj, sc.layer_in, sc.qmmf_part);
+        if (k_w < full_k) try runner.allReduceBf16(s, sc.layer_in, sc.tp_gather, take * c.hidden);
         try runner.k.rmsNorm(s, sc.layer_in, self.w.feature_norm, sc.layer_in, take, c.hidden, c.eps);
 
         for (0..num_layers) |li| {
@@ -154,7 +158,11 @@ pub const Drafter = struct {
         if (total == 0) return;
 
         try sc.buf.upload(sc.positions - sc.buf.ptr, std.mem.sliceAsBytes(pos_host[0..total]));
-        try runner.fp8(s, sc.dspark_taps, 3 * c.hidden, total, self.w.feature_proj, sc.layer_in, sc.qmmf_part);
+        const full_k = 3 * c.hidden;
+        const k_w = self.w.feature_proj.k;
+        const k0: usize = if (k_w < full_k) runner.w.share.rank * k_w else 0;
+        try runner.fp8(s, sc.dspark_taps + k0 * 2, full_k, total, self.w.feature_proj, sc.layer_in, sc.qmmf_part);
+        if (k_w < full_k) try runner.allReduceBf16(s, sc.layer_in, sc.tp_gather, total * c.hidden);
         try runner.k.rmsNorm(s, sc.layer_in, self.w.feature_norm, sc.layer_in, total, c.hidden, c.eps);
 
         for (0..num_layers) |li| {

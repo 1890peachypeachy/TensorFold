@@ -975,10 +975,12 @@ const Loader = struct {
         const c = &L.w.config;
         const sh = &L.w.share;
 
+        const fp_k: usize = if ((3 * c.hidden) % (sh.world * 128) == 0) (3 * c.hidden) / sh.world else 3 * c.hidden;
+        const fp_k0: usize = if (fp_k < 3 * c.hidden) sh.rank * fp_k else 0;
         const feature_proj = try L.loadFp8Slice(
             "model.mtp.feature_projection.weight",
             "model.mtp.feature_projection.weight_scale_inv",
-            0, c.hidden, 0, 3 * c.hidden,
+            0, c.hidden, fp_k0, fp_k,
         );
         const feature_norm = try L.putRaw("model.mtp.feature_norm.weight");
         const hc_head_fn = try L.putTransposedF32("model.mtp.mhc_contract.hc_head_fn", c.hcDim(), c.hc_mult);
