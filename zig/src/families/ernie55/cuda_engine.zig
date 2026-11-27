@@ -76,8 +76,12 @@ pub const max_parts: usize = 8;
 /// original size) are used. A shared verify's key holds every part's row count, so mixed draft depths across streams
 /// make many keys; a miss runs the forward eagerly (first sight) or captures it (second sight).
 /// TF_ERNIE55_GRAPH_STATS=1 logs the hit/eager/capture counts every 500 shared verifies.
+/// A capture costs far more than an eager forward (measured: a 64-entry cache whose keys are captured on their second
+/// sight and then rarely reused ran c8/c16 23% slower than the 8-entry one), so two knobs bound it:
+/// TF_ERNIE55_CAPTURE_AFTER=k captures a key on its k-th sight (default 2, the original; at least 2), and
+/// TF_ERNIE55_GRAPH_MAX_PARTS=m graphs only shared verifies of at most m streams (default 8, all), the wider ones eager.
 pub const shared_graph_cap: usize = 64;
-const GraphCfg = struct { active: usize = 8, stats: bool = false, read: bool = false };
+const GraphCfg = struct { active: usize = 8, stats: bool = false, capture_after: u8 = 2, max_graph_parts: usize = max_parts, read: bool = false };
 var graph_cfg: GraphCfg = .{};
 
 fn graphCfg() *const GraphCfg {
@@ -88,7 +92,15 @@ fn graphCfg() *const GraphCfg {
             if (n >= 1) graph_cfg.active = @min(n, shared_graph_cap);
         }
         if (std.c.getenv("TF_ERNIE55_GRAPH_STATS")) |v| graph_cfg.stats = std.mem.eql(u8, std.mem.span(v), "1");
-        std.log.info("ernie55: shared graph cache {d} of {d} entries, stats {s}", .{ graph_cfg.active, shared_graph_cap, if (graph_cfg.stats) "on" else "off" });
+        if (std.c.getenv("TF_ERNIE55_CAPTURE_AFTER")) |v| {
+            const k = std.fmt.parseInt(u8, std.mem.span(v), 10) catch 2;
+            graph_cfg.capture_after = @max(k, 2);
+        }
+        if (std.c.getenv("TF_ERNIE55_GRAPH_MAX_PARTS")) |v| {
+            const m = std.fmt.parseInt(usize, std.mem.span(v), 10) catch max_parts;
+            graph_cfg.max_graph_parts = @min(m, max_parts);
+        }
+        std.log.info("ernie55: shared graph cache {d} of {d} entries, capture after {d} sights, graphs up to {d} streams, stats {s}", .{ graph_cfg.active, shared_graph_cap, graph_cfg.capture_after, graph_cfg.max_graph_parts, if (graph_cfg.stats) "on" else "off" });
     }
     return &graph_cfg;
 }
@@ -103,7 +115,7 @@ const SharedVerifyKey = struct {
 const SharedVerifyEntry = struct {
     key: SharedVerifyKey = .{},
     graph: ?cuda.graph.Exec = null,
-    warmed: bool = false,
+    seen: u8 = 0, // eager forwards run for this key so far (it is captured on sight `capture_after`)
     tick: u64 = 0,
 
     fn clear(self: *SharedVerifyEntry) void {
@@ -111,7 +123,7 @@ const SharedVerifyEntry = struct {
             ge.deinit();
             self.graph = null;
         }
-        self.warmed = false;
+        self.seen = 0;
         self.key.np = 0;
     }
 };
@@ -565,7 +577,7 @@ pub const Engine = struct {
         const taps_out: u64 = if (e.drafter != null) e.sc_dec.dspark_taps else 0;
         const r = e.runner();
         const tap_row = 3 * e.w.config.hidden * 2;
-        const can_graph = (e.group == null or e.group.?.fast != null);
+        const can_graph = (e.group == null or e.group.?.fast != null) and parts.len <= graphCfg().max_graph_parts;
 
         if (can_graph) {
             const gc = graphCfg();
@@ -592,19 +604,20 @@ pub const Engine = struct {
                 break :blk &e.shared_verify_graphs[lru_idx];
             };
             ent.tick = e.graph_tick;
-            e.sv_stats[if (ent.graph != null) 0 else if (!ent.warmed) 1 else 2] += 1;
+            const eager_sight = ent.graph == null and ent.seen + 1 < gc.capture_after;
+            e.sv_stats[if (ent.graph != null) 0 else if (eager_sight) 1 else 2] += 1;
             if (gc.stats) {
                 const total = e.sv_stats[0] + e.sv_stats[1] + e.sv_stats[2];
                 if (total % 500 == 0) std.log.info("ernie55 graphs: shared verify launches={d} eager={d} captures={d} | shared draft launches={d} eager={d} captures={d} (cache {d})", .{ e.sv_stats[0], e.sv_stats[1], e.sv_stats[2], e.sd_stats[0], e.sd_stats[1], e.sd_stats[2], gc.active });
             }
             if (ent.graph) |ge| {
                 try ge.launchOn(e.stream);
-            } else if (!ent.warmed) {
+            } else if (eager_sight) {
                 try r.forwardSegs(e.stream, segs[0..parts.len], &e.sc_dec, rows, true, taps_out);
                 for (0..parts.len) |i| {
                     if (seqs[i].stash) |st| try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(st.ptr, e.sc_dec.dspark_taps + segs[i].row0 * tap_row, segs[i].n * tap_row, e.stream.handle), "cuMemcpyDtoDAsync");
                 }
-                ent.warmed = true;
+                ent.seen += 1;
             } else {
                 try cuda.graph.beginCapture(e.stream, .thread_local);
                 try r.forwardSegs(e.stream, segs[0..parts.len], &e.sc_dec, rows, true, taps_out);
