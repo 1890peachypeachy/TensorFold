@@ -48,6 +48,8 @@ pub const DsaWeights = struct {
     idx_k_norm_w: u64, // BF16 [128]
     idx_k_norm_b: u64, // BF16 [128]
     idx_weights_proj: QWeight, // BF16 [64, 4096] packed for qmmf
+    fi_gate: u64 = 0, // optional FlashIndexer BF16 [64, 4096]
+    fi_bias: u64 = 0, // optional FlashIndexer BF16 [64]
 };
 
 pub const DenseMlpWeights = struct {
@@ -209,6 +211,58 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, dir: []const u
         w.layers[li] = try L.loadLayer(l);
         if (rank == 0 and (li == 0 or li == 1 or li == 7 or li + 1 == n_layers or (li + 1) % 10 == 0)) {
             std.log.info("[ernie55] loaded layer {d}/{d} ({d:.2} GiB)", .{ li + 1, n_layers, @as(f64, @floatFromInt(w.bytes)) / (1024.0 * 1024.0 * 1024.0) });
+        }
+    }
+
+
+    // Optional Baidu FlashIndexer 8-of-64 head router (flashindexer/flashindexer.safetensors, 3.1 MB)
+    {
+        var fi_path_buf: [512]u8 = undefined;
+        const fi_path = std.fmt.bufPrint(&fi_path_buf, "{s}/flashindexer/flashindexer.safetensors", .{dir}) catch "";
+        if (fi_path.len > 0) {
+            if (std.Io.Dir.cwd().readFileAlloc(io, fi_path, gpa, .unlimited)) |raw| {
+                defer gpa.free(raw);
+                if (raw.len >= 8) {
+                    const hdr_len: usize = @intCast(std.mem.readInt(u64, raw[0..8], .little));
+                    if (8 + hdr_len <= raw.len) {
+                        const data_base = raw[8 + hdr_len ..];
+                        if (std.json.parseFromSlice(std.json.Value, gpa, raw[8 .. 8 + hdr_len], .{})) |parsed| {
+                            defer parsed.deinit();
+                            if (parsed.value == .object) {
+                                const obj = parsed.value.object;
+                                var fi_loaded: usize = 0;
+                                for (0..n_layers) |li| {
+                                    switch (w.layers[li].attn) {
+                                        .dsa => |*dsa| {
+                                            var nb1: [256]u8 = undefined;
+                                            var nb2: [256]u8 = undefined;
+                                            const gn = std.fmt.bufPrint(&nb1, "model.layers.{d}.self_attn.core_attention.indexer.linear_gate.weight", .{li}) catch continue;
+                                            const bn = std.fmt.bufPrint(&nb2, "model.layers.{d}.self_attn.core_attention.indexer.flashindexer_bias", .{li}) catch continue;
+                                            const gv = obj.get(gn) orelse continue;
+                                            const bv = obj.get(bn) orelse continue;
+                                            const goff = gv.object.get("data_offsets") orelse continue;
+                                            const boff = bv.object.get("data_offsets") orelse continue;
+                                            const g0: usize = @intCast(goff.array.items[0].integer);
+                                            const g1: usize = @intCast(goff.array.items[1].integer);
+                                            const b0: usize = @intCast(boff.array.items[0].integer);
+                                            const b1: usize = @intCast(boff.array.items[1].integer);
+                                            if (g1 <= data_base.len and b1 <= data_base.len) {
+                                                dsa.fi_gate = try L.put(data_base[g0..g1]);
+                                                dsa.fi_bias = try L.put(data_base[b0..b1]);
+                                                fi_loaded += 1;
+                                            }
+                                        },
+                                        .hca => {},
+                                    }
+                                }
+                                if (rank == 0 and fi_loaded > 0) {
+                                    std.log.info("[ernie55] loaded FlashIndexer 8-of-64 prefill head router ({d} DSA layers)", .{fi_loaded});
+                                }
+                            }
+                        } else |_| {}
+                    }
+                }
+            } else |_| {}
         }
     }
 

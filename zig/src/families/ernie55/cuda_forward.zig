@@ -552,6 +552,14 @@ pub const Runner = struct {
             try self.fp8(s, sc.layer_in, c.hidden, rows, dsa.idx_weights_proj, sc.idx_w, sc.qmmf_part);
 
             const w_scale: f32 = @floatCast(1.0 / (@sqrt(@as(f64, @floatFromInt(c.index_dim))) * @sqrt(@as(f64, @floatFromInt(c.index_heads)))));
+            const use_fi = (rows >= 16 and dsa.fi_gate != 0 and dsa.fi_bias != 0);
+            const fi_gates = sc.qmmf_part; // F32 [rows, 64]
+            const fi_q_sel = fi_gates + ((rows * 64 * 4 + 255) & ~@as(usize, 255)); // BF16 [rows, 8, 128]
+            const fi_w_sel = fi_q_sel + ((rows * 8 * 128 * 2 + 255) & ~@as(usize, 255)); // F32 [rows, 8]
+            if (use_fi) {
+                try k.bf16GemmF32Mma(s, sc.layer_in, dsa.fi_gate, fi_gates, rows, 64, c.hidden);
+                try k.dsaFlashindexerSelect(s, fi_gates, dsa.fi_bias, sc.idx_q, sc.idx_w, fi_q_sel, fi_w_sel, rows, w_scale);
+            }
             // sc.idx_scores holds [score_rows, capacity] fp32: score the rows in slices that fit it (rows sit at
             // consecutive positions ending at max_pos, so a slice's own last position bounds its older tokens).
             const score_rows = @min(sc.max_rows, 64);
@@ -565,7 +573,11 @@ pub const Runner = struct {
                 const older = if (g.older_ceil > 0) g.older_ceil else (slice_max + 1 - c.sliding_window);
                 if (b * older > score_rows * sc.capacity) return error.IndexerScoresTooSmall;
                 const pos_at = sc.positions + r0 * 4;
-                try k.dsaIndexerScoresMma(s, sc.idx_q + r0 * c.index_heads * c.index_dim * 2, g.kv.layers[li].dsa.idx_k, sc.idx_w + r0 * c.index_heads * 2, pos_at, sc.idx_scores, b, older, c.sliding_window, w_scale);
+                if (use_fi) {
+                    try k.dsaFlashindexerScoresFp8(s, fi_q_sel + r0 * 8 * 128 * 2, g.kv.layers[li].dsa.idx_k, fi_w_sel + r0 * 8 * 4, pos_at, sc.idx_scores, b, older, c.sliding_window);
+                } else {
+                    try k.dsaIndexerScoresMma(s, sc.idx_q + r0 * c.index_heads * c.index_dim * 2, g.kv.layers[li].dsa.idx_k, sc.idx_w + r0 * c.index_heads * 2, pos_at, sc.idx_scores, b, older, c.sliding_window, w_scale);
+                }
                 try k.dsaSelectTopk(s, sc.idx_scores, pos_at, sc.idx_sel + r0 * dense_width * 4, sc.idx_cnt + r0 * 4, b, older, c.index_topk, c.sliding_window);
             }
             }

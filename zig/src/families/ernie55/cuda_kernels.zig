@@ -86,6 +86,8 @@ pub const Kernels = struct {
     mxfp4_moe_combine: Function,
     dsa_indexer_scores_mma: Function,
     dsa_indexer_scores_fp8_mma: Function,
+    dsa_flashindexer_select: Function,
+    dsa_flashindexer_scores_fp8_8h_mma: Function,
     dsa_absorb_q_mma: Function,
     dsa_rope_copy: Function,
     dsa_expand_v_mma: Function,
@@ -442,6 +444,18 @@ pub const Kernels = struct {
     }
 
     /// dsaIndexerScores on tensor cores (dsa_attn.cu): one block a query row x 64 key tokens.
+    pub fn dsaFlashindexerSelect(k: *const Kernels, s: Stream, gates: u64, bias: u64, idx_q: u64, idx_w: u64, q_sel: u64, w_sel: u64, rows: usize, weights_scale: f32) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ gates, bias, idx_q, idx_w, q_sel, w_sel, ci(rows), weights_scale }) |v| a.add(v);
+        try cuda.launch.launch(k.dsa_flashindexer_select, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, s, &a);
+    }
+
+    pub fn dsaFlashindexerScoresFp8(k: *const Kernels, s: Stream, q_sel: u64, idx_k: u64, w_sel: u64, positions: u64, scores: u64, rows: usize, max_older: usize, window_size: usize) !void {
+        var a: cuda.Args = .{};
+        inline for (.{ q_sel, idx_k, w_sel, positions, scores, ci(rows), ci(max_older), ci(window_size) }) |v| a.add(v);
+        try cuda.launch.launch(k.dsa_flashindexer_scores_fp8_8h_mma, .{ .grid = .{ .x = cdiv(max_older, 64), .y = cdiv(rows, 8) }, .block = .{ .x = 128 } }, s, &a);
+    }
+
     pub fn dsaIndexerScoresMma(k: *const Kernels, s: Stream, q_idx: u64, idx_k: u64, weights: u64, positions: u64, scores: u64, rows: usize, max_older: usize, window: usize, w_scale: f32) !void {
         var a: cuda.Args = .{};
         inline for (.{ q_idx, idx_k, weights, positions, scores, ci(rows), ci(max_older), ci(window), w_scale }) |v| a.add(v);

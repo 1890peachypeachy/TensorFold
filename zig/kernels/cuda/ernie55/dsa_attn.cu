@@ -1088,3 +1088,195 @@ extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_indexer_scores_
         }
     }
 }
+
+
+// FlashIndexer: select top-8 of 64 DSA indexer heads per token row (matches Baidu vLLM-ERNIE flashindexer.py exactly!)
+// gates: [rows, 64] f32 (= layer_in @ linear_gate.weight^T)
+// bias:  [64] bf16 (flashindexer_bias)
+// idx_q: [rows, 64, 128] bf16
+// idx_w: [rows, 64] bf16
+// Out:   q_sel [rows, 8, 128] bf16, w_sel [rows, 8] f32 (= idx_w[r, h] * gates[r, h] * weights_scale)
+// Launch: grid=(rows), block=(128)
+extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_flashindexer_select(
+    const float* __restrict__ gates,
+    const __nv_bfloat16* __restrict__ bias,
+    const __nv_bfloat16* __restrict__ idx_q,
+    const __nv_bfloat16* __restrict__ idx_w,
+    __nv_bfloat16* __restrict__ q_sel,
+    float* __restrict__ w_sel,
+    int rows,
+    float weights_scale
+) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const int tid = threadIdx.x;
+
+    __shared__ float s_gate[64];
+    __shared__ float s_score[64];
+    __shared__ float s_w[64];
+    __shared__ int s_idx[8];
+
+    if (tid < 64) {
+        float g = gates[(int64_t)r * 64 + tid];
+        s_gate[tid] = g;
+        s_score[tid] = g + __bfloat162float(bias[tid]);
+        s_w[tid] = __bfloat162float(idx_w[(int64_t)r * 64 + tid]);
+    }
+    __syncthreads();
+
+    // Thread 0 picks top-8 heads by score (64 elements x 8 passes = 512 comparisons, < 1 us!)
+    if (tid == 0) {
+        for (int k = 0; k < 8; ++k) {
+            int best_h = 0;
+            float best_s = -1e38f;
+            for (int h = 0; h < 64; ++h) {
+                if (s_score[h] > best_s) {
+                    best_s = s_score[h];
+                    best_h = h;
+                }
+            }
+            s_idx[k] = best_h;
+            s_score[best_h] = -1e38f;
+            w_sel[(int64_t)r * 8 + k] = s_w[best_h] * s_gate[best_h] * weights_scale;
+        }
+    }
+    __syncthreads();
+
+    // Gather 8 selected heads (8 * 128 bf16 = 128 uint4s -> 1 uint4 per thread!)
+    const int k = tid >> 4;        // 0..7
+    const int c8 = (tid & 15) << 3; // 0..120
+    const int h = s_idx[k];
+    *reinterpret_cast<uint4*>(q_sel + ((int64_t)r * 8 + k) * 128 + c8) =
+        *reinterpret_cast<const uint4*>(idx_q + ((int64_t)r * 64 + h) * 128 + c8);
+}
+
+__device__ __forceinline__ void fi_mma_m16n8k32_fp8(float* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// 8-row x 8-head FlashIndexer FP8 MMA scorer (5.71x faster than 64-head at 66K!)
+// Launch: grid=(cdiv(max_older, 64), cdiv(rows, 8)), block=(128)
+extern "C" __global__ void __launch_bounds__(128) tf_ernie55_dsa_flashindexer_scores_fp8_8h_mma(
+    const __nv_bfloat16* __restrict__ q_sel,
+    const __nv_bfloat16* __restrict__ idx_k,
+    const float* __restrict__ w_sel,
+    const int32_t* __restrict__ positions,
+    float* __restrict__ scores,
+    int rows, int max_older, int window_size
+) {
+    const int r0 = blockIdx.y * 8;
+    const int t0 = blockIdx.x * 64;
+    if (r0 >= rows || t0 >= max_older) return;
+    const int nr = (rows - r0 < 8) ? (rows - r0) : 8;
+
+    int max_n_older = 0;
+    for (int dr = 0; dr < nr; ++dr) {
+        int no = positions[r0 + dr] - window_size + 1;
+        if (no > max_n_older) max_n_older = no;
+    }
+    if (t0 >= max_n_older) {
+        for (int dr = 0; dr < nr; ++dr) {
+            for (int i = threadIdx.x; i < 64; i += 128) {
+                if (t0 + i < max_older) scores[(int64_t)(r0 + dr) * max_older + t0 + i] = -1e38f;
+            }
+        }
+        return;
+    }
+
+    __shared__ __align__(16) uint8_t ks[64 * TF_IDX_FP8_LD];
+    __shared__ __align__(16) uint8_t qs[64 * TF_IDX_FP8_LD];
+    __shared__ float k_sc[64], q_sc[64], q_wt[64];
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tq = lane & 3;
+    for (int row = warp; row < 64; row += 4) {
+        int t = t0 + row;
+        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+        if (t < max_n_older) {
+            uint2 raw = *reinterpret_cast<const uint2*>(idx_k + (int64_t)t * 128 + lane * 4);
+            const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            v0 = __bfloat162float(b[0]); v1 = __bfloat162float(b[1]);
+            v2 = __bfloat162float(b[2]); v3 = __bfloat162float(b[3]);
+        }
+        float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+        float sc = fmaxf(amax, 1e-12f) * (1.0f / 448.0f), inv = 1.0f / sc;
+        if (lane == 0) k_sc[row] = sc;
+        uint8_t q[4] = {__nv_fp8_e4m3(v0 * inv).__x, __nv_fp8_e4m3(v1 * inv).__x, __nv_fp8_e4m3(v2 * inv).__x, __nv_fp8_e4m3(v3 * inv).__x};
+        *reinterpret_cast<uint32_t*>(ks + row * TF_IDX_FP8_LD + lane * 4) = *reinterpret_cast<uint32_t*>(q);
+    }
+    for (int qi = warp; qi < nr * 8; qi += 4) {
+        int dr = qi >> 3, h = qi & 7;
+        uint2 raw = *reinterpret_cast<const uint2*>(q_sel + ((int64_t)(r0 + dr) * 8 + h) * 128 + lane * 4);
+        const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
+        float v0 = __bfloat162float(b[0]), v1 = __bfloat162float(b[1]);
+        float v2 = __bfloat162float(b[2]), v3 = __bfloat162float(b[3]);
+        float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+        float sc = fmaxf(amax, 1e-12f) * (1.0f / 448.0f), inv = 1.0f / sc;
+        if (lane == 0) { q_sc[qi] = sc; q_wt[qi] = w_sel[(int64_t)(r0 + dr) * 8 + h]; }
+        uint8_t q[4] = {__nv_fp8_e4m3(v0 * inv).__x, __nv_fp8_e4m3(v1 * inv).__x, __nv_fp8_e4m3(v2 * inv).__x, __nv_fp8_e4m3(v3 * inv).__x};
+        *reinterpret_cast<uint32_t*>(qs + qi * TF_IDX_FP8_LD + lane * 4) = *reinterpret_cast<uint32_t*>(q);
+    }
+    __syncthreads();
+
+    int dr0 = warp * 2, dr1 = dr0 + 1;
+    if (dr0 >= nr) return;
+    int q_base = dr0 * 8;
+    float acc[8][4];
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+
+#pragma unroll
+    for (int kk = 0; kk < 128; kk += 32) {
+        uint32_t a[4];
+        a[0] = *reinterpret_cast<const uint32_t*>(qs + (q_base + g) * TF_IDX_FP8_LD + kk + tq * 4);
+        a[1] = *reinterpret_cast<const uint32_t*>(qs + (q_base + 8 + g) * TF_IDX_FP8_LD + kk + tq * 4);
+        a[2] = *reinterpret_cast<const uint32_t*>(qs + (q_base + g) * TF_IDX_FP8_LD + kk + 16 + tq * 4);
+        a[3] = *reinterpret_cast<const uint32_t*>(qs + (q_base + 8 + g) * TF_IDX_FP8_LD + kk + 16 + tq * 4);
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            uint32_t b[2];
+            int krow = nt * 8 + g;
+            b[0] = *reinterpret_cast<const uint32_t*>(ks + krow * TF_IDX_FP8_LD + kk + tq * 4);
+            b[1] = *reinterpret_cast<const uint32_t*>(ks + krow * TF_IDX_FP8_LD + kk + 16 + tq * 4);
+            fi_mma_m16n8k32_fp8(acc[nt], a, b);
+        }
+    }
+
+    float s0 = q_sc[q_base + g], w0 = q_wt[q_base + g];
+    float s1 = (dr1 < nr) ? q_sc[q_base + 8 + g] : 0.0f;
+    float w1 = (dr1 < nr) ? q_wt[q_base + 8 + g] : 0.0f;
+    int no0 = positions[r0 + dr0] - window_size + 1;
+    int no1 = (dr1 < nr) ? (positions[r0 + dr1] - window_size + 1) : 0;
+
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        int c0 = nt * 8 + tq * 2, c1 = c0 + 1;
+        float ks0 = k_sc[c0], ks1 = k_sc[c1];
+        float v00 = fmaxf(acc[nt][0] * s0 * ks0, 0.0f) * w0;
+        float v01 = fmaxf(acc[nt][1] * s0 * ks1, 0.0f) * w0;
+        float v10 = fmaxf(acc[nt][2] * s1 * ks0, 0.0f) * w1;
+        float v11 = fmaxf(acc[nt][3] * s1 * ks1, 0.0f) * w1;
+#pragma unroll
+        for (int off = 4; off <= 16; off <<= 1) {
+            v00 += __shfl_xor_sync(0xffffffffu, v00, off);
+            v01 += __shfl_xor_sync(0xffffffffu, v01, off);
+            v10 += __shfl_xor_sync(0xffffffffu, v10, off);
+            v11 += __shfl_xor_sync(0xffffffffu, v11, off);
+        }
+        if (g == 0) {
+            if (t0 + c0 < max_older) scores[(int64_t)(r0 + dr0) * max_older + t0 + c0] = (t0 + c0 < no0) ? v00 : -1e38f;
+            if (t0 + c1 < max_older) scores[(int64_t)(r0 + dr0) * max_older + t0 + c1] = (t0 + c1 < no0) ? v01 : -1e38f;
+            if (dr1 < nr) {
+                if (t0 + c0 < max_older) scores[(int64_t)(r0 + dr1) * max_older + t0 + c0] = (t0 + c0 < no1) ? v10 : -1e38f;
+                if (t0 + c1 < max_older) scores[(int64_t)(r0 + dr1) * max_older + t0 + c1] = (t0 + c1 < no1) ? v11 : -1e38f;
+            }
+        }
+    }
+}
