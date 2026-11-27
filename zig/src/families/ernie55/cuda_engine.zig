@@ -72,6 +72,27 @@ pub const Part = struct { slot: u32, ids: []const u32, out: []u32 };
 pub const BlockPart = struct { slot: u32, kept_n: usize, anchor: u32, out: []u32, advance: usize = 0 };
 pub const max_parts: usize = 8;
 
+/// Shared-window graph caches: room for `shared_graph_cap` keys, of which TF_ERNIE55_SHARED_GRAPHS (default 8, the
+/// original size) are used. A shared verify's key holds every part's row count, so mixed draft depths across streams
+/// make many keys; a miss runs the forward eagerly (first sight) or captures it (second sight).
+/// TF_ERNIE55_GRAPH_STATS=1 logs the hit/eager/capture counts every 500 shared verifies.
+pub const shared_graph_cap: usize = 64;
+const GraphCfg = struct { active: usize = 8, stats: bool = false, read: bool = false };
+var graph_cfg: GraphCfg = .{};
+
+fn graphCfg() *const GraphCfg {
+    if (!graph_cfg.read) {
+        graph_cfg.read = true;
+        if (std.c.getenv("TF_ERNIE55_SHARED_GRAPHS")) |v| {
+            const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+            if (n >= 1) graph_cfg.active = @min(n, shared_graph_cap);
+        }
+        if (std.c.getenv("TF_ERNIE55_GRAPH_STATS")) |v| graph_cfg.stats = std.mem.eql(u8, std.mem.span(v), "1");
+        std.log.info("ernie55: shared graph cache {d} of {d} entries, stats {s}", .{ graph_cfg.active, shared_graph_cap, if (graph_cfg.stats) "on" else "off" });
+    }
+    return &graph_cfg;
+}
+
 const SharedVerifyKey = struct {
     np: u8 = 0,
     slots: [max_parts]u8 = @splat(0),
@@ -145,9 +166,11 @@ pub const Engine = struct {
     snaps: std.AutoHashMapUnmanaged(u64, Snap) = .empty,
     next_snap: u64 = 1,
     dropped: std.ArrayList(u32) = .empty, // ids rank 0 freed, sent to the other ranks with the next step
-    shared_verify_graphs: [8]SharedVerifyEntry = @splat(.{}),
-    shared_draft_graphs: [8]SharedDraftEntry = @splat(.{}),
+    shared_verify_graphs: [shared_graph_cap]SharedVerifyEntry = @splat(.{}),
+    shared_draft_graphs: [shared_graph_cap]SharedDraftEntry = @splat(.{}),
     graph_tick: u64 = 0,
+    sv_stats: [3]u64 = @splat(0), // shared verify: graph launches, eager first sights, captures
+    sd_stats: [3]u64 = @splat(0), // shared draft: the same
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, rank: usize, world: usize, o: Options) !*Engine {
         const e = try gpa.create(Engine);
@@ -545,11 +568,12 @@ pub const Engine = struct {
         const can_graph = (e.group == null or e.group.?.fast != null);
 
         if (can_graph) {
+            const gc = graphCfg();
             e.graph_tick += 1;
             var slot_idx: ?usize = null;
             var lru_idx: usize = 0;
             var lru_tick: u64 = std.math.maxInt(u64);
-            for (&e.shared_verify_graphs, 0..) |*ent, ei| {
+            for (e.shared_verify_graphs[0..gc.active], 0..) |*ent, ei| {
                 if (std.meta.eql(ent.key, key)) {
                     slot_idx = ei;
                     break;
@@ -568,6 +592,11 @@ pub const Engine = struct {
                 break :blk &e.shared_verify_graphs[lru_idx];
             };
             ent.tick = e.graph_tick;
+            e.sv_stats[if (ent.graph != null) 0 else if (!ent.warmed) 1 else 2] += 1;
+            if (gc.stats) {
+                const total = e.sv_stats[0] + e.sv_stats[1] + e.sv_stats[2];
+                if (total % 500 == 0) std.log.info("ernie55 graphs: shared verify launches={d} eager={d} captures={d} | shared draft launches={d} eager={d} captures={d} (cache {d})", .{ e.sv_stats[0], e.sv_stats[1], e.sv_stats[2], e.sd_stats[0], e.sd_stats[1], e.sd_stats[2], gc.active });
+            }
             if (ent.graph) |ge| {
                 try ge.launchOn(e.stream);
             } else if (!ent.warmed) {
@@ -703,7 +732,7 @@ pub const Engine = struct {
                     var slot_idx: ?usize = null;
                     var lru_idx: usize = 0;
                     var lru_tick: u64 = std.math.maxInt(u64);
-                    for (&e.shared_draft_graphs, 0..) |*ent, ei| {
+                    for (e.shared_draft_graphs[0..graphCfg().active], 0..) |*ent, ei| {
                         if (std.meta.eql(ent.key, dkey)) {
                             slot_idx = ei;
                             break;
@@ -722,6 +751,7 @@ pub const Engine = struct {
                         break :blk &e.shared_draft_graphs[lru_idx];
                     };
                     ent.tick = e.graph_tick;
+                    e.sd_stats[if (ent.graph != null) 0 else if (!ent.warmed) 1 else 2] += 1;
                     if (ent.graph) |ge| {
                         try ge.launchOn(e.stream);
                     } else if (!ent.warmed) {
