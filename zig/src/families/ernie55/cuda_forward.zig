@@ -38,6 +38,19 @@ pub fn decodeSlices(n: usize, k: usize) u32 {
 /// One sequence's rows in a shared forward: its caches, its first row, its row count, its last position.
 pub const Seg = struct { kv: *KvCache, row0: usize, n: usize, max_pos: usize, older_ceil: usize = 0 };
 
+/// TF_ERNIE55_IDX_SPLIT=<n>: a shared verify whose DSA indexer looks back n positions or more (its older bucket)
+/// splits the indexer's rows across the ranks: each rank scores and picks one block of rows, then the picks are
+/// all-gathered. A row's scores and picks are the same arithmetic as before; only who computes them changes.
+/// 0 or unset: every rank scores every row (as before).
+var idx_split_from: ?usize = null;
+fn idxSplitFrom() usize {
+    if (idx_split_from) |v| return v;
+    const v: usize = if (std.c.getenv("TF_ERNIE55_IDX_SPLIT")) |t| std.fmt.parseInt(usize, std.mem.span(t), 10) catch 0 else 0;
+    if (v > 0) std.log.info("ernie55: shared-verify DSA indexer rows split across ranks from {d} older positions (TF_ERNIE55_IDX_SPLIT)", .{v});
+    idx_split_from = v;
+    return v;
+}
+
 pub const Runner = struct {
     k: *const Kernels,
     lane: *const Lane,
@@ -603,8 +616,30 @@ pub const Runner = struct {
 
             const w_scale: f32 = @floatCast(1.0 / (@sqrt(@as(f64, @floatFromInt(c.index_dim))) * @sqrt(@as(f64, @floatFromInt(c.index_heads)))));
             if (rows * tm.max_older > @min(sc.max_rows, 64) * sc.capacity) return error.IndexerScoresTooSmall;
-            try k.dsaIndexerScoresMmaTab(s, sc.idx_q, sc.idx_w, sc.positions, sc.idx_scores, sc.row_seg, sc.seg_tab, kv_li, layer_stride, rows, tm.max_older, c.sliding_window, w_scale);
-            try k.dsaSelectTopkTab(s, sc.idx_scores, sc.positions, sc.idx_sel, sc.idx_cnt, sc.row_seg, sc.seg_tab, rows, tm.max_older, c.index_topk, c.sliding_window);
+            const split_from = idxSplitFrom();
+            const grp: ?*const Group = if (self.group) |g| (if (g.world > 1) g else null) else null;
+            if (grp != null and split_from > 0 and tm.max_older >= split_from and rows >= grp.?.world) {
+                const g = grp.?;
+                // rank r scores and picks rows [r * per, r * per + n); the picks go to a block past its own scores,
+                // then every rank's block is all-gathered into idx_sel in rank (= row) order. Counts: a row reads its
+                // picks only when pos + 1 > dense_width, and then its count is dense_width, so every row starts at
+                // dense_width and this rank's own rows take what the pick kernel writes.
+                const per = (rows + g.world - 1) / g.world;
+                const lo = @min(rows, g.rank * per);
+                const n = @min(rows - lo, per);
+                const picks = sc.idx_scores + per * tm.max_older * 4;
+                if (per * tm.max_older + per * dense_width > @min(sc.max_rows, 64) * sc.capacity) return error.IndexerScoresTooSmall;
+                const d = k.dsa_mod.d;
+                try d.check(d.api.cuMemsetD32Async(sc.idx_cnt, @intCast(dense_width), rows, s.handle), "cuMemsetD32Async");
+                if (n > 0) {
+                    try k.dsaIndexerScoresMmaTab(s, sc.idx_q + lo * c.index_heads * c.index_dim * 2, sc.idx_w + lo * c.index_heads * 2, sc.positions + lo * 4, sc.idx_scores, sc.row_seg + lo * 4, sc.seg_tab, kv_li, layer_stride, n, tm.max_older, c.sliding_window, w_scale);
+                    try k.dsaSelectTopkTab(s, sc.idx_scores, sc.positions + lo * 4, picks, sc.idx_cnt + lo * 4, sc.row_seg + lo * 4, sc.seg_tab, n, tm.max_older, c.index_topk, c.sliding_window);
+                }
+                try g.allGather(s, picks, sc.idx_sel, per * dense_width * 4);
+            } else {
+                try k.dsaIndexerScoresMmaTab(s, sc.idx_q, sc.idx_w, sc.positions, sc.idx_scores, sc.row_seg, sc.seg_tab, kv_li, layer_stride, rows, tm.max_older, c.sliding_window, w_scale);
+                try k.dsaSelectTopkTab(s, sc.idx_scores, sc.positions, sc.idx_sel, sc.idx_cnt, sc.row_seg, sc.seg_tab, rows, tm.max_older, c.index_topk, c.sliding_window);
+            }
         }
 
         const q_head = c.mla_qk_nope + c.mla_qk_rope;
