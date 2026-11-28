@@ -17,15 +17,25 @@ pub fn rule(s: Sampling) Rule {
     return cuda.sample.rule(s);
 }
 
+/// The argmax as a draw, for the paths that must draw a greedy row from `full` (a grammar-masked row). sample.cu
+/// ranks candidates by logit * inv_t, so inv_t = 1 with top_k = 1 keeps exactly the largest logit. (inv_t = 0
+/// scaled every logit to 0, and the tie went to token 0, <|ERNIE_PAD|>.) Unmasked greedy rows take
+/// Engine.pickGreedy, the F32 argmax, instead.
 pub fn greedyRule() Rule {
     return .{
         .seed = 0,
-        .inv_t = 0,
+        .inv_t = 1,
         .top_p = 1,
         .near = 0,
         .min_log = -std.math.inf(f32),
         .top_k = 1,
     };
+}
+
+test "greedyRule keeps the logits as they are and one candidate" {
+    const r = greedyRule();
+    try std.testing.expectEqual(@as(f32, 1), r.inv_t);
+    try std.testing.expectEqual(@as(u32, 1), r.top_k);
 }
 
 pub const Sampler = struct {

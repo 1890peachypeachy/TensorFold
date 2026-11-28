@@ -628,16 +628,31 @@ pub const Engine = struct {
             for (parts, 0..) |pt, i| @memcpy(pt.out, all[segs[i].row0..][0..segs[i].n]);
             return;
         }
-        // Single RoCE allGather + single-sync drawBatch for ALL concurrent streams!
+        // A round with a sampled stream: one RoCE allGather + one drawBatch for the sampled streams. Greedy streams
+        // in the same round take the F32 argmax an all-greedy round takes (pickGreedy), so a greedy stream's tokens
+        // never depend on whether a sampled stream shares its round.
         try e.smp.gatherF32(&e.k, e.stream, e.group, &e.w.share, e.sc_dec.logits, rows);
         var draw_items: [max_parts]sampler.Sampler.DrawItem = undefined;
+        var n_draw: usize = 0;
+        var any_greedy = false;
         for (parts, 0..) |pt, i| {
+            const scfg = seqs[i].sampling orelse {
+                any_greedy = true;
+                continue;
+            };
             const g = segs[i];
-            const rl = if (seqs[i].sampling) |scfg| sampler.rule(scfg) else sampler.greedyRule();
-            draw_items[i] = .{ .row0 = g.row0, .rows = g.n, .first_pos = seqs[i].kv.pos + 1, .rule = rl, .out = pt.out };
+            draw_items[n_draw] = .{ .row0 = g.row0, .rows = g.n, .first_pos = seqs[i].kv.pos + 1, .rule = sampler.rule(scfg), .out = pt.out };
+            n_draw += 1;
         }
-        try e.smp.drawBatch(e.stream, draw_items[0..parts.len], rows);
+        try e.smp.drawBatch(e.stream, draw_items[0..n_draw], rows);
         if (e.group) |grp| try grp.check();
+        if (any_greedy) {
+            var all: [window_rows]u32 = undefined;
+            try e.pickGreedy(&e.sc_dec, 0, rows, all[0..rows]);
+            for (parts, 0..) |pt, i| {
+                if (seqs[i].sampling == null) @memcpy(pt.out, all[segs[i].row0..][0..segs[i].n]);
+            }
+        }
     }
 
     pub fn keep(e: *Engine, n: usize) !void {
